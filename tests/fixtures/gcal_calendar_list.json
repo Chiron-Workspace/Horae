@@ -1,0 +1,9 @@
+{
+  "kind": "calendar#calendarList",
+  "items": [
+    {"id": "primary@group.calendar.google.com", "summary": "HDT.IE.ADVANCED 32", "primary": false},
+    {"id": "school@group.calendar.google.com", "summary": "School", "primary": false},
+    {"id": "autostudy@group.calendar.google.com", "summary": "Auto-Study", "primary": false},
+    {"id": "personal@group.calendar.google.com", "summary": "Personal", "primary": true}
+  ]
+}

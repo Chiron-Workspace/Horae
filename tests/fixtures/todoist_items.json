@@ -1,0 +1,42 @@
+{
+  "items": [
+    {
+      "id": "1001",
+      "content": "Làm BTVN Vật Lí [180m]",
+      "description": "",
+      "labels": [],
+      "checked": false,
+      "due": {"date": "2026-01-07", "string": "07 Jan 2026"}
+    },
+    {
+      "id": "1002",
+      "content": "Ôn IELTS [60m/ngày]",
+      "description": "",
+      "labels": ["ontap"],
+      "checked": false
+    },
+    {
+      "id": "1003",
+      "content": "Team meeting",
+      "description": "",
+      "labels": ["event"],
+      "checked": false,
+      "due": {"date": "2026-01-06T14:00:00", "string": "06 Jan 2026 14:00"}
+    },
+    {
+      "id": "1004",
+      "content": "Làm BTVN Hoá [60m]",
+      "description": "Thời gian làm dự kiến: 60 phút",
+      "labels": [],
+      "checked": false,
+      "due": {"date": "2026-01-09"}
+    },
+    {
+      "id": "1005",
+      "content": "Task không deadline",
+      "description": "",
+      "labels": [],
+      "checked": false
+    }
+  ]
+}

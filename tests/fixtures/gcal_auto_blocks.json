@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "id": "auto1",
+      "summary": "[Auto] [assignment] Làm BTVN Vật Lí",
+      "description": "Todoist task ID: 12345\nSource: 12345",
+      "start": {"dateTime": "2026-01-04T07:00:00+07:00"},
+      "end": {"dateTime": "2026-01-04T08:00:00+07:00"}
+    },
+    {
+      "id": "auto2",
+      "summary": "[Auto] [assignment] Làm BTVN Vật Lí",
+      "description": "Todoist task ID: 12345\nSource: 12345",
+      "start": {"dateTime": "2026-01-04T08:30:00+07:00"},
+      "end": {"dateTime": "2026-01-04T09:30:00+07:00"}
+    },
+    {
+      "id": "auto3",
+      "summary": "[Auto] [ongoing] Ôn IELTS",
+      "description": "Todoist task ID: ontask1\nSource: ontask1",
+      "start": {"dateTime": "2026-01-04T10:00:00+07:00"},
+      "end": {"dateTime": "2026-01-04T11:00:00+07:00"}
+    },
+    {
+      "id": "auto4",
+      "summary": "[Auto] [assignment] Làm BTVN Hoá",
+      "description": "Todoist task ID: 67890\nSource: 67890",
+      "start": {"dateTime": "2026-01-05T07:00:00+07:00"},
+      "end": {"dateTime": "2026-01-05T08:00:00+07:00"}
+    }
+  ]
+}
