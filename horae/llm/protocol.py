@@ -48,5 +48,5 @@ class LLMProvider(Protocol):
     name: str
     model: str
 
-    def complete(self, messages: list[Message], *, max_tokens: int = 1000,
+    def complete(self, messages: list[Message], *, max_tokens: int = 4000,
                  temperature: float = 0.0) -> str: ...

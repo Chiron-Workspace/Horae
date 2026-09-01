@@ -660,6 +660,8 @@ Chạy lại với cùng snapshot live sau khi thêm replacement và tách gate:
 
 - max_tokens: 200 → 4000 (200 và cả 1000 đều đã được đo thất bại
   trong thực tế; reasoning budget không tỉ lệ với độ dài prompt)
+- Default max_tokens ở protocol và 4 provider: 1000 → 4000, để
+  call-site quên truyền tham số cũng không rơi vào ngân sách đã đo thất bại
 - Thêm LLMTruncatedError(LLMTransientError), bắt finish_reason="length"
   / stop_reason="max_tokens" ở tầng provider, trước khi content rời khỏi
   hàm complete()

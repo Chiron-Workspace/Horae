@@ -27,7 +27,7 @@ class AnthropicProvider:
         self._api_key = api_key
         self._post = post
 
-    def complete(self, messages: list[Message], *, max_tokens: int = 1000,
+    def complete(self, messages: list[Message], *, max_tokens: int = 4000,
                  temperature: float = 0.0) -> str:
         url = "https://api.anthropic.com/v1/messages"
         headers = {
