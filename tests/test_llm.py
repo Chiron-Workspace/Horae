@@ -12,6 +12,7 @@ from horae.llm.protocol import (
     LLMBadRequestError,
     LLMError,
     LLMQuotaError,
+    LLMTruncatedError,
     LLMTransientError,
     Message,
 )
@@ -22,7 +23,9 @@ from horae.llm.registry import (
     NoProviderConfigured,
     ProviderConfig,
 )
-from horae.llm.tasks.parse_title import parse_title, ParsedTitle
+from horae.llm.providers.openai import OpenAIProvider
+from horae.llm.tasks.parse_title import _cache_key, parse_title, ParsedTitle
+from horae.state.store import LocalStore
 
 
 # ---------------------------------------------------------------- fake provider
@@ -315,3 +318,104 @@ def test_52_runner_with_llm_none_still_green():
     result = parse_title("Any task title", None)
     assert result.source == "default"
     # Runner không gọi LLM trong 2A → không cần kiểm thêm
+
+
+# ---------------------------------------------------------------- 53-55: truncation + content cache
+
+
+def test_53_finish_reason_length_raises_truncated_not_silent():
+    """finish_reason='length', content rỗng → lỗi truncation, không nuốt im lặng."""
+    data = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+    provider = OpenAIProvider(
+        "fake-model",
+        "fake-key",
+        post=lambda url, headers, body: (200, data),
+    )
+
+    with pytest.raises(LLMTruncatedError):
+        provider.complete([Message("user", "parse this")])
+
+
+def test_54_same_content_cached_despite_nondeterministic_llm(tmp_path):
+    """Cùng title/description chỉ gọi LLM một lần dù response có thể đổi."""
+    class NondeterministicProvider(FakeProvider):
+        def __init__(self):
+            super().__init__("p1", "m1")
+            self._responses = [
+                '{"minutes": 45, "title": "Same task source"}',
+                '{"minutes": 180, "title": "Different task"}',
+            ]
+
+        def complete(self, messages, *, max_tokens=1000, temperature=0.0):
+            self.call_count += 1
+            return self._responses[self.call_count - 1]
+
+    llm = LLMClient(_cfg(_pcfg("p1")))
+    fake_provider = NondeterministicProvider()
+    store = LocalStore(str(tmp_path / "state"))
+    import horae.llm.registry as reg
+    original_build = reg._build_provider
+    reg._build_provider = lambda pcfg: fake_provider
+    try:
+        os.environ["FAKE_KEY"] = "fake"
+        first = parse_title(
+            "Same task source",
+            llm,
+            description="same description",
+            store=store,
+        )
+        second = parse_title(
+            "Same task source",
+            llm,
+            description="same description",
+            store=store,
+        )
+        assert fake_provider.call_count == 1
+        assert first == second
+    finally:
+        reg._build_provider = original_build
+
+
+def test_55_fallback_never_cached_retries_next_time(tmp_path):
+    """JSON hỏng không cache; lần sau retry và chỉ cache khi JSON hợp lệ."""
+    class RetryProvider(FakeProvider):
+        def __init__(self):
+            super().__init__("p1", "m1")
+            self._responses = [
+                "not json",
+                '{"minutes": 75, "title": "Retry task source"}',
+            ]
+
+        def complete(self, messages, *, max_tokens=1000, temperature=0.0):
+            self.call_count += 1
+            return self._responses[self.call_count - 1]
+
+    title = "Retry task source"
+    description = "retry description"
+    llm = LLMClient(_cfg(_pcfg("p1")))
+    fake_provider = RetryProvider()
+    store = LocalStore(str(tmp_path / "state"))
+    import horae.llm.registry as reg
+    original_build = reg._build_provider
+    reg._build_provider = lambda pcfg: fake_provider
+    try:
+        os.environ["FAKE_KEY"] = "fake"
+        first = parse_title(title, llm, description=description, store=store)
+        key = _cache_key(title, description)
+        assert first.source == "default"
+        assert key not in store.load_llm_cache()
+
+        second = parse_title(title, llm, description=description, store=store)
+        assert second.estimate_minutes == 75
+        assert second.source == "llm"
+        assert fake_provider.call_count == 2
+        cache = store.load_llm_cache()
+        assert key in cache
+        assert set(cache[key]) == {"estimate_minutes", "kind", "cached_at"}
+        assert (tmp_path / "state" / "llm_cache.json").exists()
+
+        third = parse_title(title, llm, description=description, store=store)
+        assert third == second
+        assert fake_provider.call_count == 2
+    finally:
+        reg._build_provider = original_build

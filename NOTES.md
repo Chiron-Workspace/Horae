@@ -655,3 +655,26 @@ Chạy lại với cùng snapshot live sau khi thêm replacement và tách gate:
 ## Kết quả cuối hiện tại
 
 - 231 test pass (205 3A + 19 reconciliation + 6 sabotage + 1 lifecycle; các suite trước đã nằm trong 205).
+
+## Sửa truncation + cache theo nội dung (trước khi nối 2B)
+
+- max_tokens: 200 → 4000 (200 và cả 1000 đều đã được đo thất bại
+  trong thực tế; reasoning budget không tỉ lệ với độ dài prompt)
+- Thêm LLMTruncatedError(LLMTransientError), bắt finish_reason="length"
+  / stop_reason="max_tokens" ở tầng provider, trước khi content rời khỏi
+  hàm complete()
+- Bỏ except Exception: pass trong parse JSON, bắt đúng
+  (JSONDecodeError, KeyError, ValueError), log lại
+- Cache theo sha256(title|description), CHỈ ghi khi parse thành công.
+  Fallback KHÔNG BAO GIỜ được cache — nếu không, một lần LLM hỏng sẽ
+  pin sai vĩnh viễn (không có cơ chế tự sửa vì hash không đổi khi
+  nội dung task không đổi)
+
+## Nguyên tắc kiểm thử rút ra (áp dụng cho mọi module LLM trong Chiron)
+
+Bug loại này (truncation ngẫu nhiên, non-determinism của reasoning
+model) KHÔNG lộ ra qua test với fake provider — toàn bộ 15 test cũ
+của test_llm.py xanh trước khi phát hiện qua chạy API thật.
+Nguyên tắc: mọi module gọi LLM cần một lần "smoke test với provider
+thật" như điều kiện bắt buộc trước khi coi milestone đóng — bổ sung
+cho test suite, không thay thế.

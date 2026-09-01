@@ -11,6 +11,7 @@ from horae.llm.protocol import (
     LLMAuthError,
     LLMBadRequestError,
     LLMQuotaError,
+    LLMTruncatedError,
     LLMTransientError,
     Message,
 )
@@ -42,6 +43,10 @@ class AnthropicProvider:
         })
         status, data = self._do_post(url, headers, body)
         if status == 200:
+            if data.get("stop_reason") == "max_tokens":
+                raise LLMTruncatedError(
+                    f"{self.name}: response bị cắt do hết max_tokens"
+                )
             return data["content"][0]["text"]
         _raise_error(status, data, "anthropic")
 

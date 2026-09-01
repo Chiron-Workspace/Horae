@@ -33,6 +33,10 @@ class LLMTransientError(LLMError):
     """5xx, timeout, mạng. → fallback."""
 
 
+class LLMTruncatedError(LLMTransientError):
+    """Response bị cắt ngang do hết max_tokens trước khi sinh xong nội dung."""
+
+
 class LLMBadRequestError(LLMError):
     """Prompt sai → LỖI CỦA TA. → DỪNG NGAY, không fallback."""
 

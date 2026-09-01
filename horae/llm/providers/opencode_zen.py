@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from horae.llm.protocol import Message
+from horae.llm.protocol import LLMTruncatedError, Message
 from horae.llm.providers.anthropic import _default_post, _raise_error
 from horae.llm.providers._http import HttpPost
 from horae.llm.registry import _register_provider
@@ -37,6 +37,10 @@ class OpenCodeZenProvider:
         else:
             status, data = _default_post(url, headers, body)
         if status == 200:
+            if data["choices"][0].get("finish_reason") == "length":
+                raise LLMTruncatedError(
+                    f"{self.name}: response bị cắt do hết max_tokens"
+                )
             return data["choices"][0]["message"]["content"]
         _raise_error(status, data, "opencode_zen")
 

@@ -1,4 +1,4 @@
-"""Lưu trữ cục bộ: config.json + runs/{date}.json. Không database, không lưu tiến độ."""
+"""Lưu trữ cục bộ: config.json, runs/{date}.json và cache LLM."""
 
 from __future__ import annotations
 
@@ -39,5 +39,19 @@ class LocalStore:
         path = os.path.join(self._runs_dir, f"{day.isoformat()}.json")
         if not os.path.exists(path):
             return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def save_llm_cache(self, cache: dict[str, dict[str, Any]]) -> None:
+        """Ghi cache ước lượng LLM vào ``llm_cache.json``."""
+        path = os.path.join(self._base_dir, "llm_cache.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+    def load_llm_cache(self) -> dict[str, dict[str, Any]]:
+        """Đọc cache ước lượng LLM; chưa có file thì coi như cache rỗng."""
+        path = os.path.join(self._base_dir, "llm_cache.json")
+        if not os.path.exists(path):
+            return {}
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
