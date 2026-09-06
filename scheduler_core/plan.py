@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from scheduler_core.allocate import allocate_assignments, allocate_ongoing
 from scheduler_core.blocks import cut_blocks
@@ -32,6 +33,8 @@ class PlanResult:
     completed_task_ids: tuple[str, ...]
     infeasible_task_ids: tuple[str, ...]
     shortfall: dict[str, int]
+    # Deadline đã trôi qua tại thời điểm chạy — KHÁC infeasible. Xem build_plan.
+    overdue_task_ids: tuple[str, ...] = ()
 
 
 def _date_range(start: date, end: date) -> list[date]:
@@ -50,7 +53,26 @@ def build_plan(
     events_by_day: Mapping[date, Sequence[FixedEvent]],
     existing_blocks: Mapping[date, int],
     config: SchedulerConfig,
+    now: datetime | None = None,
 ) -> PlanResult:
+    """``now`` là mốc thời gian của lần chạy, do caller cung cấp (lõi không đọc
+    đồng hồ hệ thống). Nó chỉ dùng để tách ``overdue`` khỏi ``infeasible``:
+
+    - ``overdue``: ``deadline <= now`` — đã trễ thật, người dùng phải xử lý
+      (đánh dấu hoàn thành, dời hạn). Hệ thống không xếp gì được nữa.
+    - ``infeasible``: ``deadline > now`` nhưng số phút còn lại vượt tổng
+      capacity của các ngày xếp được trước hạn — CHƯA trễ, nhưng sắp trễ nếu
+      không can thiệp. Đây mới là cảnh báo sớm có ích.
+
+    Task hạn trong hôm nay (sau ``now``) rơi vào ``infeasible`` chứ không phải
+    ``overdue``: chưa trễ, nhưng lịch chỉ xếp từ D1 = today+1 nên không còn ô
+    nào trước hạn.
+
+    ``now=None`` → lấy 00:00 của ``today`` theo tz của config. Giữ lõi thuần
+    (không `datetime.now()`); hệ quả là task hạn sớm hơn trong chính hôm nay
+    sẽ vào ``infeasible`` thay vì ``overdue``. Caller muốn phân loại chính xác
+    theo giờ thì truyền ``now`` vào.
+    """
     config.validate()
 
     d1 = today + timedelta(days=1)
@@ -75,13 +97,25 @@ def build_plan(
         events = events_by_day.get(day, [])
         capacities[day] = compute_day_capacity(day, events, config)
 
+    tz = ZoneInfo(config.timezone)
+    run_now = now if now is not None else datetime.combine(today, time.min, tzinfo=tz)
+    if run_now.tzinfo is None:
+        run_now = run_now.replace(tzinfo=tz)
+
+    overdue: list[str] = []
     infeasible: list[str] = []
     for a in active:
+        deadline = a.deadline if a.deadline.tzinfo else a.deadline.replace(tzinfo=tz)
+        if deadline <= run_now:
+            # Đã trễ thật — không phải "không đủ chỗ".
+            overdue.append(a.task_id)
+            continue
         task_days = [d for d in sorted_dates if d <= a.deadline.date()]
         capacity_task = sum(capacities[d].capacity_minutes for d in task_days)
         if a.remaining_minutes > capacity_task:
             infeasible.append(a.task_id)
     infeasible_t = tuple(sorted(infeasible))
+    overdue_t = tuple(sorted(overdue))
 
     assignment_result = allocate_assignments(active, capacities, config)
     ongoing_alloc = allocate_ongoing(
@@ -134,4 +168,5 @@ def build_plan(
         completed_task_ids=completed,
         infeasible_task_ids=infeasible_t,
         shortfall=assignment_result.shortfall,
+        overdue_task_ids=overdue_t,
     )

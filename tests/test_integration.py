@@ -291,3 +291,76 @@ def test_19_planning_horizon_2_caps_dend():
     # no_day_dominance là warning, không phải error → ok vẫn True
     assert result.ok is True
     assert "no_day_dominance" in result.warnings
+
+
+# ================================================================ overdue ≠ infeasible
+
+
+def _task(tid, minutes, deadline):
+    return Assignment(task_id=tid, title=tid, estimate_minutes=minutes, deadline=deadline)
+
+
+def test_overdue_deadline_past_now_is_not_infeasible():
+    """Hạn đã trôi qua tại thời điểm chạy → overdue, KHÔNG phải infeasible.
+
+    Hai nhãn ứng với hai hành động khác nhau: overdue là việc của người dùng
+    (dọn Todoist), infeasible là cảnh báo sớm của hệ thống.
+    """
+    late = _task("late", 60, datetime.combine(TODAY - timedelta(days=7), time(15, 30), tzinfo=TZ))
+    now = datetime.combine(TODAY, time(12, 23), tzinfo=TZ)
+    result = build_plan(TODAY, [late], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN, now)
+    assert result.overdue_task_ids == ("late",)
+    assert "late" not in result.infeasible_task_ids
+
+
+def test_due_today_after_now_is_infeasible_not_overdue():
+    """Hạn hôm nay nhưng chưa tới giờ → CHƯA trễ, nhưng lịch chỉ xếp từ D1.
+
+    Đây là ca thường gặp (task nộp trong ngày) và trước đây bị gộp chung vào
+    infeasible cùng với task quá hạn thật.
+    """
+    today_task = _task("today", 60, datetime.combine(TODAY, time(15, 45), tzinfo=TZ))
+    now = datetime.combine(TODAY, time(12, 23), tzinfo=TZ)
+    result = build_plan(TODAY, [today_task], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN, now)
+    assert result.overdue_task_ids == ()
+    assert "today" in result.infeasible_task_ids
+
+
+def test_future_deadline_too_big_is_infeasible_not_overdue():
+    """Hạn còn ở tương lai nhưng không đủ chỗ → infeasible, không overdue."""
+    big = _task("big", 3000, datetime.combine(WED, time(21, 0), tzinfo=TZ))
+    now = datetime.combine(TODAY, time(12, 23), tzinfo=TZ)
+    result = build_plan(TODAY, [big], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN, now)
+    assert result.overdue_task_ids == ()
+    assert "big" in result.infeasible_task_ids
+
+
+def test_deadline_tomorrow_fits_is_neither():
+    """Hạn ngày mai và đủ chỗ → không overdue, không infeasible."""
+    ok_task = _task("ok", 60, datetime.combine(WEEK_MON, time(21, 0), tzinfo=TZ))
+    now = datetime.combine(TODAY, time(12, 23), tzinfo=TZ)
+    result = build_plan(TODAY, [ok_task], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN, now)
+    assert result.overdue_task_ids == ()
+    assert result.infeasible_task_ids == ()
+
+
+def test_now_none_defaults_to_start_of_today():
+    """now=None → mốc là 00:00 hôm nay; lõi không đọc đồng hồ hệ thống.
+
+    Hệ quả có chủ đích: task hạn sớm hơn trong CHÍNH hôm nay vào infeasible
+    chứ không phải overdue, vì lõi không biết bây giờ là mấy giờ.
+    """
+    yesterday = _task("y", 60, datetime.combine(TODAY - timedelta(days=1), time(21, 0), tzinfo=TZ))
+    this_morning = _task("m", 60, datetime.combine(TODAY, time(9, 0), tzinfo=TZ))
+    result = build_plan(
+        TODAY, [yesterday, this_morning], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN
+    )
+    assert result.overdue_task_ids == ("y",)
+    assert "m" in result.infeasible_task_ids
+    # Truyền now đúng giờ thì "m" mới được nhận là overdue
+    now = datetime.combine(TODAY, time(12, 23), tzinfo=TZ)
+    exact = build_plan(
+        TODAY, [yesterday, this_morning], ongoing(), events_by_day(), {}, PRESET_STUDENT_VN, now
+    )
+    assert exact.overdue_task_ids == ("m", "y")
+    assert exact.infeasible_task_ids == ()

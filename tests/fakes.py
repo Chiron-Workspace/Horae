@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
@@ -154,3 +155,50 @@ class FakeCalendarWriter:
             block for block in self._state
             if start <= block.start < end
         )
+
+
+# ---------------------------------------------------------------- fake LLM client
+
+
+@dataclass(frozen=True)
+class FakeLLMResponse:
+    """Bản sao tối giản của llm.registry.LLMResponse (chỉ cần .text)."""
+
+    text: str
+    provider_name: str = "fake"
+    model: str = "fake-model"
+    attempts: tuple[tuple[str, str], ...] = (("fake", "ok"),)
+
+
+class FakeLLMClient:
+    """LLMClient giả cho test parsing/runner. Đếm số lần được gọi.
+
+    Đứng ở tầng LLMClient (cái mà parse_tasks/run nhận), không phải tầng
+    provider: parse_title gọi ``llm.complete(...)`` rồi đọc ``.text``.
+    Không có mạng, không đọc biến môi trường.
+    """
+
+    def __init__(
+        self,
+        *,
+        response: str | None = None,
+        minutes: int = 45,
+        title: str = "Tiêu đề LLM dọn",
+        kind: str = "assignment",
+        error: Exception | None = None,
+    ):
+        if response is None:
+            response = json.dumps(
+                {"minutes": minutes, "title": title, "kind": kind}, ensure_ascii=False
+            )
+        self._response = response
+        self._error = error
+        self.call_count = 0
+        self.calls: list[list[Any]] = []
+
+    def complete(self, messages, **opts) -> FakeLLMResponse:
+        self.call_count += 1
+        self.calls.append(list(messages))
+        if self._error is not None:
+            raise self._error
+        return FakeLLMResponse(text=self._response)

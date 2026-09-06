@@ -13,6 +13,9 @@ from tests.fakes import FakeCalendarReader, FakeCalendarWriter, FakeTaskSource
 
 TZ = ZoneInfo(PRESET_STUDENT_VN.timezone)
 TODAY = date(2026, 1, 4)  # Sunday → D1 = Monday 2026-01-05
+# `now` bắt buộc khi dry_run=False. Trưa ngày chạy: mọi block đều ở D1+ nên
+# kiểm "block đã bắt đầu" không đổi hành vi của các test cũ.
+NOW = datetime.combine(TODAY, time(12, 0), tzinfo=TZ)
 
 
 def _raw_task(tid, title, *, due=None, labels=()):
@@ -98,7 +101,7 @@ def test_32_ok_false_writer_not_called(monkeypatch):
 
     writer = FakeCalendarWriter()
     source, reader = _basic_setup()
-    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(writer.created) == 0
     assert report.plan.ok is False
     assert any("block_size" in e for e in report.errors)
@@ -131,7 +134,7 @@ def test_33_ok_with_warnings_writer_called(monkeypatch):
 
     writer = FakeCalendarWriter()
     source, reader = _basic_setup()
-    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(writer.created) == 1  # writer được gọi
     assert "no_day_dominance" in report.warnings
     assert report.plan.ok is True
@@ -168,7 +171,7 @@ def test_34_existing_block_skipped(monkeypatch):
     existing = [_auto_block("old1", "vatli", d1, 7, 0, 8, 0)]  # 60'
     source, reader = _basic_setup(existing_blocks=existing)
     writer = FakeCalendarWriter()
-    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     # Tổng existing (60') >= tổng planned (60') → bỏ qua cả hai
     assert len(writer.created) == 0
     assert len(report.skipped_existing) == 2
@@ -205,7 +208,7 @@ def test_35_readback_mismatch_reported(monkeypatch):
             return ()  # rỗng → lệch
 
     writer = MismatchWriter()
-    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(report.readback_mismatch) > 0
     # Không raise — report vẫn trả về bình thường
     assert report.plan.ok is True
@@ -237,7 +240,7 @@ def test_36_writer_fail_midway(monkeypatch):
 
     source, reader = _basic_setup()
     writer = FakeCalendarWriter(fail_on=1)  # block index 1 (thứ 2) raise
-    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     # Block 0 tạo OK, block 1 lỗi, block 2 tạo OK
     assert len(report.created) == 3
     assert report.created[0].error is None
@@ -264,7 +267,7 @@ def test_37_idempotent_two_runs():
     writer = FakeCalendarWriter()
 
     # Lần 1
-    report1 = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+    report1 = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(report1.created) > 0  # tạo block
 
     # Cập nhật reader với block đã tạo (giả lập calendar đã có)
@@ -276,7 +279,7 @@ def test_37_idempotent_two_runs():
     writer2 = FakeCalendarWriter()
 
     # Lần 2: cùng state, giờ có block trong D1/D2
-    report2 = run(TODAY, [source], reader2, writer2, PRESET_STUDENT_VN, dry_run=False)
+    report2 = run(TODAY, [source], reader2, writer2, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(writer2.created) == 0  # không tạo thêm
 
 
@@ -313,7 +316,7 @@ def test_38_recovery_after_partial_write(monkeypatch):
     # Lần 1: writer lỗi sau block 0, và tiếp tục lỗi → chỉ tạo được 30'
     source, reader = _basic_setup()
     writer1 = FakeCalendarWriter(fail_on=1, fail_all_after=True)
-    report1 = run(TODAY, [source], reader, writer1, PRESET_STUDENT_VN, dry_run=False)
+    report1 = run(TODAY, [source], reader, writer1, PRESET_STUDENT_VN, dry_run=False, now=NOW)
     assert len(writer1.created) == 1  # chỉ block 0 thành công, block 1+ fail
 
     # Lần 2: đọc lại thấy 30' đã có, plan định 90' → thiếu 60' → tạo bù
@@ -330,7 +333,7 @@ def test_38_recovery_after_partial_write(monkeypatch):
     writer2 = FakeCalendarWriter()
     monkeypatch.setattr(runner_mod, "build_plan", lambda *a, **kw: fake_plan)
     source2, _ = _basic_setup()
-    report2 = run(TODAY, [source2], reader2, writer2, PRESET_STUDENT_VN, dry_run=False)
+    report2 = run(TODAY, [source2], reader2, writer2, PRESET_STUDENT_VN, dry_run=False, now=NOW)
 
     # 2 block còn lại (30+30=60') được tạo bù
     assert len(writer2.created) == 2
@@ -368,6 +371,7 @@ def test_39_three_run_diff_deletion_lifecycle():
         writer,
         DEFAULT_CONFIG,
         dry_run=False,
+        now=NOW,
     )
     assert [entry.block.duration_minutes for entry in first.created] == [90, 90]
     assert first.deleted == ()
@@ -380,6 +384,7 @@ def test_39_three_run_diff_deletion_lifecycle():
         writer,
         DEFAULT_CONFIG,
         dry_run=False,
+        now=NOW,
     )
     assert [entry.event_id for entry in second.planned_deletes] == ["fake-event-2"]
     assert [entry.event_id for entry in second.deleted if entry.success] == ["fake-event-2"]
@@ -397,6 +402,7 @@ def test_39_three_run_diff_deletion_lifecycle():
         writer,
         DEFAULT_CONFIG,
         dry_run=False,
+        now=NOW,
     )
     assert [entry.event_id for entry in third.planned_deletes] == ["fake-event-1"]
     assert [entry.event_id for entry in third.deleted if entry.success] == ["fake-event-1"]
@@ -405,3 +411,303 @@ def test_39_three_run_diff_deletion_lifecycle():
         datetime.combine(d1, time(0, 0), tzinfo=tz),
         datetime.combine(d2 + timedelta(days=1), time(0, 0), tzinfo=tz),
     ) == ()
+
+
+# ---------------------------------------------------------------- nối llm (2B)
+
+
+# Các test được thêm ở phần nối LLM này — không nằm trong "test cũ".
+_NEW_LLM_TESTS = (
+    "test_runner_llm_none_all_previous_tests_still_pass",
+    "test_runner_passes_llm_through_to_parse_tasks",
+    "test_runner_llm_failure_does_not_crash_run",
+    "test_runner_report_shows_estimate_source",
+    "test_runner_store_reaches_parse_title_cache",
+    "test_runner_bad_request_returns_report_without_writing",
+    "test_runner_real_write_without_store_is_blocked",
+    "test_runner_dry_run_without_store_only_warns",
+    "test_runner_warns_when_now_missing",
+    "test_runner_real_write_without_now_is_blocked",
+)
+
+
+def _legacy_runner_tests():
+    """Mọi test có sẵn của file này trước khi nối LLM."""
+    import tests.test_runner as mod
+
+    return [
+        (name, fn)
+        for name, fn in vars(mod).items()
+        if name.startswith("test_") and name not in _NEW_LLM_TESTS and callable(fn)
+    ]
+
+
+def test_runner_llm_none_all_previous_tests_still_pass():
+    """Không truyền llm → mọi test runner cũ vẫn xanh, và parse_tasks luôn nhận llm=None.
+
+    Bằng chứng LLM không lẻn vào thành phụ thuộc ngầm ở tầng runner.
+    """
+    import inspect
+
+    import horae.runner as runner_mod
+    from horae.adapters.parsing import parse_tasks as real_parse_tasks
+
+    seen: list[tuple[object, object]] = []
+
+    def spy(raw_tasks, config, llm=None, store=None):
+        seen.append((llm, store))
+        return real_parse_tasks(raw_tasks, config, llm, store)
+
+    with pytest.MonkeyPatch.context() as outer:
+        outer.setattr(runner_mod, "parse_tasks", spy)
+        legacy = _legacy_runner_tests()
+        assert len(legacy) >= 9  # 9 test cũ của file này
+        for _name, fn in legacy:
+            if "monkeypatch" in inspect.signature(fn).parameters:
+                with pytest.MonkeyPatch.context() as inner:
+                    fn(inner)
+            else:
+                fn()
+
+    assert seen  # đã thực sự đi qua parse_tasks
+    assert all(llm is None and store is None for llm, store in seen)
+
+    # llm=None tường minh cho kết quả y hệt lúc không truyền tham số
+    source_a, reader_a = _basic_setup()
+    source_b, reader_b = _basic_setup()
+    report_default = run(TODAY, [source_a], reader_a, None, PRESET_STUDENT_VN, dry_run=True)
+    report_none = run(
+        TODAY, [source_b], reader_b, None, PRESET_STUDENT_VN, llm=None, dry_run=True
+    )
+    assert report_none.parse == report_default.parse
+    assert report_none.plan.blocks == report_default.plan.blocks
+    assert report_none.warnings == report_default.warnings
+    assert report_none.errors == report_default.errors
+
+
+def test_runner_passes_llm_through_to_parse_tasks():
+    """Truyền llm vào run() → llm THẬT SỰ được dùng, runner không âm thầm bỏ qua."""
+    from tests.fakes import FakeLLMClient
+
+    llm = FakeLLMClient(minutes=45, title="Ôn chương điện xoay chiều")
+    tasks = [_raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7))]
+    source, reader = _basic_setup(tasks=tasks)
+    report = run(
+        TODAY, [source], reader, None, PRESET_STUDENT_VN, llm=llm, dry_run=True
+    )
+    assert llm.call_count > 0
+    assert report.estimate_sources["tudo"] == "llm"
+    assert report.parse.assignments[0].estimate_minutes == 45
+
+
+def test_runner_llm_failure_does_not_crash_run():
+    """LLM lỗi mọi provider → run() KHÔNG raise, task đó về default, task khác vẫn chạy."""
+    from horae.llm.registry import LLMAllProvidersFailed
+    from tests.fakes import FakeLLMClient
+
+    llm = FakeLLMClient(error=LLMAllProvidersFailed((("p1", "LLMQuotaError"),)))
+    tasks = [
+        _raw_task("vatli", "Làm BTVN Vật Lí [180m]", due=date(2026, 1, 7)),
+        _raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7)),
+        _raw_task("ielts", "Ôn IELTS [60m/ngày]", labels=("ontap",)),
+    ]
+    source, reader = _basic_setup(tasks=tasks)
+    report = run(
+        TODAY, [source], reader, None, PRESET_STUDENT_VN, llm=llm, dry_run=True
+    )
+    assert llm.call_count == 1
+    sources = report.estimate_sources
+    assert sources["tudo"] == "default"
+    assert sources["vatli"] == "title"        # task khác vẫn xử lý bình thường
+    assert sources["ielts"] == "title"
+    by_id = {a.task_id: a for a in report.parse.assignments}
+    assert by_id["tudo"].estimate_minutes == 60   # rơi về mặc định
+    assert by_id["vatli"].estimate_minutes == 180
+    assert any("LLM" in w and "tudo" in w for w in report.warnings)
+
+
+def test_runner_report_shows_estimate_source():
+    """Báo cáo phân biệt được "60 phút vì LLM đoán" và "60 phút vì không đoán được"."""
+    from tests.fakes import FakeLLMClient
+
+    llm = FakeLLMClient(minutes=60, title="Ôn chương điện")
+    tasks = [
+        _raw_task("vatli", "Làm BTVN Vật Lí [180m]", due=date(2026, 1, 7)),
+        _raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7)),
+        _raw_task("ielts", "Ôn IELTS [60m/ngày]", labels=("ontap",)),
+    ]
+    source, reader = _basic_setup(tasks=tasks)
+    report = run(
+        TODAY, [source], reader, None, PRESET_STUDENT_VN, llm=llm, dry_run=True
+    )
+    table = report.classification_table()
+    assert "Todoist — phân loại" in table
+    assert "source" in table
+    for line in table.splitlines():
+        if line.startswith("tudo"):
+            assert "llm" in line and "60" in line
+        if line.startswith("vatli"):
+            assert "title" in line and "180" in line
+    assert {row.kind for row in report.classifications} == {"assignment", "ongoing"}
+
+
+def test_runner_store_reaches_parse_title_cache(tmp_path):
+    """store truyền qua run() → lần chạy thứ hai trúng cache, không gọi LLM lại."""
+    from horae.state.store import LocalStore
+    from tests.fakes import FakeLLMClient
+
+    store = LocalStore(str(tmp_path))
+    llm = FakeLLMClient(minutes=45)
+    tasks = [_raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7))]
+
+    source, reader = _basic_setup(tasks=tasks)
+    first = run(TODAY, [source], reader, None, PRESET_STUDENT_VN,
+                llm=llm, store=store, dry_run=True)
+    assert llm.call_count == 1
+
+    source2, reader2 = _basic_setup(tasks=tasks)
+    second = run(TODAY, [source2], reader2, None, PRESET_STUDENT_VN,
+                 llm=llm, store=store, dry_run=True)
+    assert llm.call_count == 1  # cache chặn lời gọi thứ hai
+    assert second.estimate_sources == first.estimate_sources == {"tudo": "llm"}
+    assert second.parse.assignments == first.parse.assignments
+    assert not any("KHÔNG được cache" in w for w in first.warnings)
+
+
+def test_runner_bad_request_returns_report_without_writing():
+    """LLMBadRequestError → run() dừng, KHÔNG ghi, nhưng vẫn trả báo cáo có dấu vết."""
+    from horae.llm.protocol import LLMBadRequestError
+    from tests.fakes import FakeLLMClient
+
+    import tempfile
+
+    from horae.state.store import LocalStore
+
+    llm = FakeLLMClient(error=LLMBadRequestError("prompt sai"))
+    writer = FakeCalendarWriter()
+    tasks = [
+        _raw_task("vatli", "Làm BTVN Vật Lí [180m]", due=date(2026, 1, 7)),
+        _raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7)),
+    ]
+    source, reader = _basic_setup(tasks=tasks)
+    # store thật để đi qua được cổng llm_without_store — ca cần kiểm ở đây là
+    # prompt sai, không phải thiếu cache.
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN,
+                     llm=llm, store=LocalStore(tmp), dry_run=False, now=NOW)
+
+    assert len(writer.created) == 0 and len(writer.deleted) == 0  # không chạm calendar
+    assert report.plan.ok is False
+    assert any(e.startswith("llm_bad_request:") for e in report.errors)
+    assert any("prompt LLM sai" in w for w in report.warnings)
+    assert report.parse.assignments == ()   # không task nào được xử lý tiếp
+    assert report.reconciliation is None
+
+
+def test_runner_real_write_without_store_is_blocked():
+    """dry_run=False + llm + thiếu store → DỪNG, không ghi, không gọi LLM lần nào.
+
+    Ghi thật bằng ước lượng LLM không cache là cấu hình phi xác định: mỗi đêm
+    một con số khác cho cùng một task chưa đổi nội dung. Cổng chặn chạy trước
+    mọi lời gọi mạng nên cũng không tốn API call nào.
+    """
+    from tests.fakes import FakeLLMClient
+
+    llm = FakeLLMClient(minutes=45)
+    writer = FakeCalendarWriter()
+    source, reader = _basic_setup()
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN,
+                 llm=llm, store=None, dry_run=False, now=NOW)
+
+    assert report.plan.ok is False
+    assert any(e.startswith("llm_without_store:") for e in report.errors)
+    assert len(writer.created) == 0 and len(writer.deleted) == 0
+    assert report.reconciliation is None
+    assert llm.call_count == 0          # dừng trước cả khi đọc task
+    assert source.fetch_count == 0      # không tốn lời gọi Todoist nào
+
+    # Có store → không bị chặn
+    import tempfile
+
+    from horae.state.store import LocalStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source2, reader2 = _basic_setup()
+        ok_report = run(TODAY, [source2], reader2, FakeCalendarWriter(),
+                        PRESET_STUDENT_VN, llm=llm, store=LocalStore(tmp),
+                        dry_run=False, now=NOW)
+    assert not any(e.startswith("llm_without_store:") for e in ok_report.errors)
+
+    # Không có llm → cổng không áp (đường không-LLM ghi thật vẫn như cũ)
+    source3, reader3 = _basic_setup()
+    no_llm = run(TODAY, [source3], reader3, FakeCalendarWriter(),
+                 PRESET_STUDENT_VN, dry_run=False, now=NOW)
+    assert not any(e.startswith("llm_without_store:") for e in no_llm.errors)
+    assert no_llm.plan.ok is True
+
+
+def test_runner_dry_run_without_store_only_warns():
+    """dry_run=True + llm + thiếu store → chỉ cảnh báo, vẫn chạy hết (không ghi gì)."""
+    from tests.fakes import FakeLLMClient
+
+    llm = FakeLLMClient(minutes=45)
+    tasks = [_raw_task("tudo", "Ôn lại chương điện xoay chiều", due=date(2026, 1, 7))]
+    source, reader = _basic_setup(tasks=tasks)
+    report = run(TODAY, [source], reader, None, PRESET_STUDENT_VN,
+                 llm=llm, store=None, dry_run=True)
+
+    assert not any(e.startswith("llm_without_store:") for e in report.errors)
+    assert any("KHÔNG được cache" in w for w in report.warnings)
+    assert report.estimate_sources["tudo"] == "llm"
+
+
+def test_runner_warns_when_now_missing():
+    """now=None → cảnh báo nêu CẢ HAI hậu quả, không chỉ nhãn hiển thị.
+
+    Hậu quả thứ hai nặng hơn: reconcile chỉ chạy kiểm "block đã bắt đầu thì
+    không xóa" khi now khác None.
+    """
+    source, reader = _basic_setup()
+    report = run(TODAY, [source], reader, None, PRESET_STUDENT_VN, dry_run=True)
+    warn = [w for w in report.warnings if w.startswith("now=None:")]
+    assert len(warn) == 1
+    assert "overdue" in warn[0] and "đã bắt đầu" in warn[0]
+
+    # Truyền now → không còn cảnh báo
+    source2, reader2 = _basic_setup()
+    exact = run(TODAY, [source2], reader2, None, PRESET_STUDENT_VN, dry_run=True,
+                now=datetime.combine(TODAY, time(12, 23), tzinfo=TZ))
+    assert not any(w.startswith("now=None:") for w in exact.warnings)
+
+
+def test_runner_real_write_without_now_is_blocked():
+    """dry_run=False + thiếu now → DỪNG, không ghi, không gọi mạng.
+
+    Lý do chặn không phải nhãn hiển thị: reconcile chỉ chạy kiểm "replacement
+    delete bị chặn do block đã bắt đầu" khi now khác None, nên thiếu now ở chế
+    độ ghi là tắt cơ chế chống xóa block đang chạy dở.
+    """
+    writer = FakeCalendarWriter()
+    source, reader = _basic_setup()
+    report = run(TODAY, [source], reader, writer, PRESET_STUDENT_VN, dry_run=False)
+
+    assert report.plan.ok is False
+    assert any(e.startswith("now_required_for_write:") for e in report.errors)
+    assert "đã bắt đầu" in report.errors[0]
+    assert len(writer.created) == 0 and len(writer.deleted) == 0
+    assert report.reconciliation is None
+    assert source.fetch_count == 0   # chặn trước mọi lời gọi mạng
+
+    # Có now → chạy bình thường
+    source2, reader2 = _basic_setup()
+    ok_report = run(TODAY, [source2], reader2, FakeCalendarWriter(),
+                    PRESET_STUDENT_VN, dry_run=False, now=NOW)
+    assert not any(e.startswith("now_required_for_write:") for e in ok_report.errors)
+    assert ok_report.plan.ok is True
+
+    # dry_run=True thiếu now → KHÔNG chặn, chỉ cảnh báo
+    source3, reader3 = _basic_setup()
+    dry = run(TODAY, [source3], reader3, None, PRESET_STUDENT_VN, dry_run=True)
+    assert not any(e.startswith("now_required_for_write:") for e in dry.errors)
+    assert any(w.startswith("now=None:") for w in dry.warnings)
+    assert dry.plan.ok is True

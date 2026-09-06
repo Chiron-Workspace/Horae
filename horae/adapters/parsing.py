@@ -6,7 +6,7 @@ import re
 import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 from zoneinfo import ZoneInfo
 
 from horae.settings import DEFAULT_ESTIMATE_MINUTES, DEFAULT_ONGOING_MINUTES
@@ -14,8 +14,30 @@ from scheduler_core.config import SchedulerConfig
 from scheduler_core.models import Assignment, OngoingTask
 from horae.adapters.protocols import RawTask
 
+if TYPE_CHECKING:  # chỉ để chú thích kiểu — không import horae.llm lúc chạy
+    from horae.llm.registry import LLMClient
+    from horae.state.store import LocalStore
+
 
 # ---------------------------------------------------------------- result
+
+
+@dataclass(frozen=True)
+class TaskClassification:
+    """Một dòng của bảng "Todoist — phân loại".
+
+    ``source`` cho biết ước lượng đến từ đâu: ``title`` ([Nm] trong tiêu đề),
+    ``description`` (số phút trong mô tả), ``llm`` (parse_title đoán), hay
+    ``default`` (không đoán được gì — dùng hằng số mặc định). Người vận hành
+    đọc báo cáo dry-run cần phân biệt "60 phút vì LLM đoán vậy" với
+    "60 phút vì không đoán được gì cả".
+    """
+
+    task_id: str
+    title: str
+    kind: Literal["assignment", "ongoing"]
+    estimate_minutes: int
+    source: Literal["title", "description", "llm", "default"]
 
 
 @dataclass(frozen=True)
@@ -26,6 +48,12 @@ class ParseResult:
     ongoing: tuple[OngoingTask, ...]
     skipped: tuple[str, ...]  # task_id bị bỏ qua (label @event)
     warnings: tuple[str, ...]
+    classifications: tuple[TaskClassification, ...] = ()
+
+    @property
+    def estimate_sources(self) -> dict[str, str]:
+        """{task_id: source} — tra nhanh nguồn ước lượng của từng task."""
+        return {row.task_id: row.source for row in self.classifications}
 
 
 # ---------------------------------------------------------------- regex
@@ -90,18 +118,70 @@ def _normalize_labels(labels: Sequence[str]) -> set[str]:
     return {lbl.lstrip("@").lower() for lbl in labels}
 
 
+def _estimate_via_llm(
+    raw: RawTask, llm: "LLMClient", store: "LocalStore | None"
+) -> tuple[int, str, str, list[str]]:
+    """Hỏi parse_title khi CẢ HAI luật regex đều thất bại.
+
+    Trả (minutes, source, title, warnings). LLM không cho kết quả dùng được
+    (lỗi tạm thời, JSON hỏng, không có provider) → rơi về đúng nhánh mặc định
+    cũ, kèm một cảnh báo để báo cáo phân biệt được hai trường hợp.
+    ``LLMBadRequestError`` vẫn thoát ra ngoài: đó là lỗi prompt của ta,
+    parse_title cố ý không nuốt.
+
+    LLM chỉ đóng góp ``estimate_minutes``. Tiêu đề LUÔN giữ nguyên bản gốc,
+    kể cả khi parse_title trả ``cleaned_title`` do LLM dọn: cache của
+    parse_title không lưu ``cleaned_title``, nên lần chạy đầu (gọi LLM) và
+    lần sau (trúng cache) sẽ cho hai tiêu đề khác nhau cho cùng một task.
+    Dùng tiêu đề gốc để hai lần chạy cho ra cùng một kết quả.
+    """
+    # Import cục bộ: đường đi llm=None không nạp horae.llm, và tránh vòng lặp
+    # import (parse_title import ngược lại regex_parse_title của module này).
+    from horae.llm.tasks.parse_title import parse_title
+
+    parsed = parse_title(raw.title, llm, description=raw.description, store=store)
+    if parsed.source == "llm" and parsed.estimate_minutes > 0:
+        return (parsed.estimate_minutes, "llm", raw.title, [])
+    return (
+        DEFAULT_ESTIMATE_MINUTES,
+        "default",
+        raw.title,
+        [
+            f"task {raw.task_id}: LLM không cho ước lượng dùng được, "
+            f"dùng mặc định {DEFAULT_ESTIMATE_MINUTES}"
+        ],
+    )
+
+
 # ---------------------------------------------------------------- public
 
 
 def parse_tasks(
-    raw_tasks: Sequence[RawTask], config: SchedulerConfig
+    raw_tasks: Sequence[RawTask],
+    config: SchedulerConfig,
+    llm: "LLMClient | None" = None,
+    store: "LocalStore | None" = None,
 ) -> ParseResult:
-    """Phân loại RawTask → Assignment / OngoingTask / skipped."""
+    """Phân loại RawTask → Assignment / OngoingTask / skipped.
+
+    ``llm`` mặc định None → hành vi giống hệt trước khi nối LLM: task không
+    parse được nhận ``DEFAULT_ESTIMATE_MINUTES`` với ``source="default"``.
+    Chỉ khi ``llm is not None`` VÀ tiêu đề không có [Nm] VÀ description không
+    có số phút thì parse_title mới được gọi — nó đứng SAU hai luật regex,
+    không thay thế chúng.
+
+    ``store`` là cache ước lượng theo nội dung (sha256 của title|description).
+    Không có store thì mỗi lần chạy lại hỏi LLM lại cho cùng một task chưa
+    đổi nội dung — đúng thứ phi xác định mà cache sinh ra để chặn. Vì vậy
+    gọi có ``llm`` mà thiếu ``store`` sẽ sinh cảnh báo trong báo cáo.
+    """
     tz = ZoneInfo(config.timezone)
     assignments: list[Assignment] = []
     ongoing: list[OngoingTask] = []
     skipped: list[str] = []
     warns: list[str] = []
+    rows: list[TaskClassification] = []
+    warned_no_store = False
 
     for raw in raw_tasks:
         labels = _normalize_labels(raw.labels)
@@ -133,13 +213,23 @@ def parse_tasks(
             ongoing.append(
                 OngoingTask(task_id=raw.task_id, title=title, daily_target_minutes=target)
             )
+            rows.append(
+                TaskClassification(
+                    task_id=raw.task_id,
+                    title=title,
+                    kind="ongoing",
+                    estimate_minutes=target,
+                    source="title" if m else "default",
+                )
+            )
             continue
 
         # 3. Còn lại, có due date → Assignment
         if raw.due is None:
             # Không có due date → không tạo Assignment (Assignment cần deadline)
             warns.append(
-                f"task {raw.task_id}: có [Nm] nhưng không có due date → không tạo Assignment"
+                f"task {raw.task_id}: không có due date → không tạo Assignment "
+                f"(và không hỏi LLM: không có deadline thì không dựng được Assignment)"
             )
             continue
 
@@ -152,6 +242,18 @@ def parse_tasks(
                 minutes = desc_min
                 source = "description"
                 cleaned_title = raw.title  # không bóc từ tiêu đề → giữ nguyên
+            elif llm is not None:
+                # Luật 3, chỉ chạy khi hai luật regex trên đều thất bại.
+                if store is None and not warned_no_store:
+                    warned_no_store = True
+                    warns.append(
+                        "LLM được gọi mà không có store: kết quả KHÔNG được cache, "
+                        "mỗi lần chạy sẽ hỏi lại LLM cho cùng một task"
+                    )
+                minutes, source, cleaned_title, llm_warns = _estimate_via_llm(
+                    raw, llm, store
+                )
+                warns.extend(llm_warns)
             else:
                 minutes = DEFAULT_ESTIMATE_MINUTES
                 source = "default"
@@ -183,12 +285,22 @@ def parse_tasks(
                 deadline=deadline,
             )
         )
+        rows.append(
+            TaskClassification(
+                task_id=raw.task_id,
+                title=cleaned_title,
+                kind="assignment",
+                estimate_minutes=minutes,
+                source=source,
+            )
+        )
 
     return ParseResult(
         assignments=tuple(assignments),
         ongoing=tuple(ongoing),
         skipped=tuple(skipped),
         warnings=tuple(warns),
+        classifications=tuple(rows),
     )
 
 

@@ -680,3 +680,438 @@ của test_llm.py xanh trước khi phát hiện qua chạy API thật.
 Nguyên tắc: mọi module gọi LLM cần một lần "smoke test với provider
 thật" như điều kiện bắt buộc trước khi coi milestone đóng — bổ sung
 cho test suite, không thay thế.
+
+---
+
+# NOTES — Nối `parse_title` vào `parsing.py` và `runner.py`
+
+## Xác nhận điều kiện sống còn: `llm=None` không đổi bất cứ nhánh nào
+
+Đã kiểm ba lớp, không chỉ đọc code:
+
+1. **`parse_tasks(raw_tasks, config)` và `parse_tasks(raw_tasks, config, llm=None)` cho `ParseResult` bằng nhau** (`test_parsing_llm_none_unchanged_behavior`). Nhánh LLM là một `elif llm is not None` chèn giữa nhánh description và nhánh default; khi `llm is None`, luồng đi đúng `else: minutes = DEFAULT_ESTIMATE_MINUTES; source = "default"` như trước — không có câu lệnh nào khác được chạy thêm.
+2. **Toàn bộ test cũ của `test_parsing.py` (16) và `test_runner.py` (9) được chạy lại** với `llm=None` truyền tường minh (monkeypatch helper `_parse`, và spy quanh `runner.parse_tasks`), không dựa vào giá trị mặc định của tham số. Spy xác nhận mọi lời gọi `parse_tasks` từ các test runner cũ đều nhận `llm=None`.
+3. **`horae.llm` không được nạp lúc chạy khi `llm=None`.** Chạy `run(..., dry_run=True)` trong một tiến trình sạch rồi kiểm `sys.modules`: không có module nào bắt đầu bằng `horae.llm`. Đạt được nhờ hai chi tiết: annotation kiểu `LLMClient` đặt trong `if TYPE_CHECKING` (cả `parsing.py` lẫn `runner.py`), và `from horae.llm.tasks.parse_title import parse_title` là import **cục bộ** bên trong `_estimate_via_llm`. Import cục bộ còn cần thiết để tránh vòng lặp import: `parse_title.py` import ngược `regex_parse_title` của `parsing.py`.
+
+Hệ quả: hệ thống vẫn chạy đầu-cuối khi KHÔNG cấu hình provider nào. Đã chạy thử với `LLMClient` trỏ vào provider có `api_key_env` không tồn tại: `NoProviderConfigured` bị `parse_title` nuốt đúng như thiết kế, task rơi về `default`, `run()` không raise.
+
+## Thứ tự ưu tiên (không đổi, chỉ chèn thêm một bậc)
+
+`parse_title` là **bậc 3**, sau hai luật regex đã có:
+
+1. `[Nm]` trong tiêu đề → `source="title"`
+2. số phút trong description → `source="description"`
+3. `llm is not None` → `parse_title` → `source="llm"`
+4. còn lại → `DEFAULT_ESTIMATE_MINUTES`, `source="default"`
+
+## Diễn giải (chỗ spec chưa phủ hết)
+
+1. **Tiêu đề có `[Nm]` KHÔNG hợp lệ (`[0m]`) → vẫn không gọi LLM.** Spec viết điều kiện là "task không có `[Nm]` trong tiêu đề"; `[0m]` thì token *có* mặt, chỉ là giá trị vô lý. Giữ nguyên hành vi cũ (cảnh báo + default) để không đổi thứ tự ưu tiên đã có và giữ `test_12` nguyên vẹn. Muốn LLM đoán hộ trường hợp này thì phải là một quyết định riêng, không phải hệ quả ngầm của việc nối.
+
+2. **Task không có due date → không gọi LLM.** Nhánh này `continue` trước khi trích thời lượng (không tạo `Assignment` được vì thiếu deadline). Gọi LLM cho một task sắp bị bỏ đi là tiêu tiền vô ích.
+
+3. **Task `@ontap` và `@event` không gọi LLM.** `[Nm/ngày]` và nhãn `@event` là luật phân loại theo nhãn, `parse_title` chỉ trả `estimate_minutes` cho Assignment. Trường `kind` mà `parse_title` trả về **không** được dùng để phân loại lại: nhãn Todoist vẫn là nguồn quyết định duy nhất cho assignment/ongoing.
+
+4. **Khi LLM thắng, `Assignment.title` giữ NGUYÊN tiêu đề gốc** (sửa sau review — lúc đầu dùng `cleaned_title` do LLM dọn; xem mục "Bất đối xứng cleaned_title ↔ cache" ở dưới). LLM chỉ đóng góp `estimate_minutes`.
+
+5. **JSON contract của `parse_title` giữ nguyên `{"minutes": int, "title": str}`.** Spec của task này mô tả kết quả là `{"estimate_minutes": 45, "kind": "assignment"}` — đó là hình dạng của dataclass `ParsedTitle`, không phải hình dạng JSON mà provider trả về. Không sửa `parse_title` (task cấm), nên `FakeLLMClient` trong test trả JSON đúng contract đang có và test kiểm `ParsedTitle` đã merge thành `estimate_minutes=45, source="llm"`.
+
+6. **`LLMBadRequestError` vẫn thoát ra ngoài `run()`.** `parse_title` cố ý không nuốt nó (lỗi prompt là lỗi của ta). Spec chỉ yêu cầu `run()` không raise với `LLMAllProvidersFailed` — mà lỗi đó là `LLMError`, được `parse_title` bắt và rơi về default. Che luôn `BadRequest` sẽ làm hỏng ý đồ đã chốt ở 2B.
+
+7. **LLM không cho kết quả dùng được → một cảnh báo trong report.** `parse_title` chỉ ghi log, không trả tín hiệu lỗi; `parse_tasks` phát hiện qua `parsed.source != "llm"` và thêm cảnh báo `task {id}: LLM không cho ước lượng dùng được, dùng mặc định 60`. Nhờ vậy báo cáo phân biệt được "LLM đã thử và hỏng" với "không có LLM".
+
+8. **`store` (cache LLM) đã được nối** (bổ sung sau review — xem mục "Sửa sau review nối 2B" ở dưới). `parse_tasks(raw_tasks, config, llm, store)` và `run(..., llm=..., store=...)`.
+
+## Nguồn ước lượng trong báo cáo (mục 3)
+
+`ParseResult` chưa từng trả `source` ra ngoài (chỉ dùng nội bộ rồi vứt). Đã thêm:
+
+- `TaskClassification(task_id, title, kind, estimate_minutes, source)` — một dòng cho mỗi task thành Assignment hoặc OngoingTask.
+- `ParseResult.classifications` (tuple, mặc định rỗng nên không phá call-site nào) và `ParseResult.estimate_sources` → `{task_id: source}`.
+- `RunReport.classifications`, `RunReport.estimate_sources`, và `RunReport.classification_table()` — in bảng "Todoist — phân loại" dạng text cho dry-run.
+
+Task bị skip (`@event`) không có dòng `TaskClassification` (không có ước lượng nào để nêu nguồn) nhưng vẫn xuất hiện trong `classification_table()` với `kind=skipped`; danh sách đầy đủ vẫn ở `parse.skipped`.
+
+Với ongoing, `source` là `title` khi có `[Nm/ngày]`, `default` khi dùng `DEFAULT_ONGOING_MINUTES`.
+
+## Sửa lại ghi chú cũ
+
+Mục "LLM là tùy chọn thật" của NOTES Task 2B viết *"`runner.py` không nhận `llm` làm tham số"*. Câu đó không còn đúng: `run()` giờ có tham số keyword-only `llm`, mặc định `None`. Điều **vẫn đúng và quan trọng hơn** là `runner.py` không tự dựng `LLMClient` và không đọc biến môi trường LLM nào — việc đó là của nơi gọi `run()`.
+
+## Lệch so với chữ spec
+
+- Chữ ký trong spec là `run(today, sources, config, *, llm=None, dry_run)`. Chữ ký thật đang có thêm `reader`, `writer`, `now`. Giữ nguyên chữ ký thật, chỉ chèn `llm` vào phần keyword-only — đổi chữ ký cho khớp spec sẽ phá 9 test runner cũ.
+- Spec gọi fake là "FakeProvider có đếm số lần gọi". Nhưng thứ `parse_tasks`/`run` nhận là một `LLMClient` (trả `LLMResponse` có `.text`), không phải `LLMProvider` (trả `str`). Đã thêm `FakeLLMClient` vào `tests/fakes.py` đúng tầng đó; `FakeProvider` ở `test_llm.py` giữ nguyên cho test registry.
+- Spec liệt kê 7 test mới (241 tổng). Thực tế 12 (246): thêm `test_runner_report_shows_estimate_source` cho mục 3 (mục 3 bắt buộc hiển thị `source` nhưng không kèm test bắt buộc nào), và 4 test nữa từ review (cache + cảnh báo thiếu store + bad request).
+
+## Kết quả
+
+- 246 test pass (234 cũ + 12 mới). Không sửa `scheduler_core/`, không sửa `horae/llm/`, không sửa test cũ.
+
+## Đường gọi tay cho dry-run (không có entrypoint chính thức)
+
+`runner.run()` không tự dựng `LLMClient`, nên người vận hành dựng nó ở tầng gọi. Đoạn đủ dùng cho dry-run 2/3:
+
+```python
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+import horae.llm.providers  # noqa: F401 — import để các provider tự đăng ký factory
+from horae.llm.registry import LLMClient, LLMConfig, ProviderConfig
+from horae.adapters.todoist import TodoistSource
+from horae.adapters.gcal import GoogleCalendarReader, GoogleCalendarWriter
+from horae.runner import run
+from horae.state.store import LocalStore
+from scheduler_core.config import PRESET_STUDENT_VN
+
+# Thứ tự providers = thứ tự fallback. api_key_env là TÊN biến môi trường.
+# Provider thiếu key bị bỏ qua (chỉ warning), không raise.
+llm = LLMClient(LLMConfig(providers=(
+    ProviderConfig(name="opencode_zen", model="<model>", api_key_env="OPENCODE_ZEN_API_KEY"),
+    ProviderConfig(name="anthropic",    model="<model>", api_key_env="ANTHROPIC_API_KEY"),
+)))
+
+config = PRESET_STUDENT_VN
+report = run(
+    date.today(),
+    [TodoistSource()],
+    GoogleCalendarReader(config),
+    GoogleCalendarWriter(config),   # dry_run=True nên writer không bị gọi
+    config,
+    llm=llm,                          # bỏ dòng này → chạy hoàn toàn không LLM, y như trước
+    store=LocalStore("./.horae"),     # BẮT BUỘC khi có llm: cache theo nội dung
+    now=datetime.now(ZoneInfo(config.timezone)),   # để tách overdue khỏi infeasible
+    dry_run=True,
+)
+
+print(report.classification_table())   # cột source: title / description / llm / default
+print("plan_ok:", report.plan.ok, "gate:", report.gate_passed)
+print("creates:", len(report.planned_creates), "deletes:", len(report.planned_deletes))
+print("overdue (bạn dọn Todoist):", report.overdue_task_ids)
+print("infeasible (sắp trễ):", report.plan.infeasible_task_ids)
+for w in report.warnings:
+    print("WARN:", w)
+```
+
+Đọc bảng: dòng `source=llm` là ước lượng do LLM đoán (cần soi lại), dòng `source=default` là "không đoán được gì" — nếu có `llm` trong lời gọi mà vẫn ra `default` thì tìm cảnh báo `LLM không cho ước lượng dùng được` để biết LLM đã thử và hỏng.
+
+---
+
+# NOTES — Sửa sau review nối 2B (4 điểm)
+
+## 1. Nối `store` — cache phải sống trên đường thật, không chỉ trong test
+
+`parse_title` có cache theo nội dung (`sha256(title|description)`) từ 2B, nhưng bước nối đầu tiên gọi `parse_title(..., store=None)`, nghĩa là **đường thật không có cache**: mỗi lần chạy lại hỏi LLM lại cho cùng một task chưa đổi nội dung — đúng thứ phi xác định mà 6 điều kiện trước 2B sinh ra để chặn. Đã vá trước khi dry-run 2/3:
+
+- `parse_tasks(raw_tasks, config, llm=None, store=None)` và `run(..., llm=None, store=None, ...)`. `store` đi cùng đường với `llm`: runner **không** tự tạo `LocalStore`, không tự chọn thư mục cache — vẫn là quyết định của tầng gọi, đồng nhất với `llm`.
+- Test `test_parsing_store_caches_llm_result`: gọi `parse_tasks` hai lần cùng input + cùng store → `call_count == 1`, và kết quả lần hai bằng lần một từng trường. Đổi nội dung task → hash đổi → `call_count == 2`. Đây là test 54 nhưng ở **tầng `parse_tasks`**, vì giữa call-site và cache giờ có thêm một lớp gọi.
+- Test `test_runner_store_reaches_parse_title_cache`: hai lần `run(..., store=...)` → LLM chỉ bị gọi một lần. Kiểm cả tầng runner vì đó mới là tầng người vận hành dùng.
+
+**Quên `store` giờ là lỗi ồn, không im lặng.** Có `llm` mà thiếu `store`, ngay khi LLM thực sự bị gọi lần đầu, report nhận cảnh báo `LLM được gọi mà không có store: kết quả KHÔNG được cache...`. Cảnh báo chỉ phát một lần mỗi lần chạy và không phát nếu không task nào phải hỏi LLM.
+
+## 2. Bất đối xứng `cleaned_title` ↔ cache (phát hiện khi nối cache)
+
+Cache của `parse_title` lưu `{"estimate_minutes", "kind", "cached_at"}` — **không lưu `cleaned_title`**. Khi trúng cache, `parse_title` trả `cleaned_title=raw`. Hệ quả nếu đường chính dùng `cleaned_title` làm `Assignment.title`: lần chạy đầu (gọi LLM) và mọi lần sau (trúng cache) cho **hai tiêu đề khác nhau cho cùng một task chưa đổi nội dung** → tiêu đề event trên calendar nhảy giữa các lần chạy.
+
+Không sửa `horae/llm/` (task cấm, và đây là lựa chọn thiết kế hợp lý của cache: chỉ lưu thứ đắt tiền là con số ước lượng). Vá ở phía call-site: `_estimate_via_llm` **luôn trả `raw.title`**. LLM chỉ đóng góp `estimate_minutes` — xem mục 4 dưới đây. Reconciliation khớp block theo `task_id`/ngày, tiêu đề chỉ dùng để sort, nên thay đổi này không ảnh hưởng diff.
+
+Nếu sau này muốn dùng tiêu đề LLM dọn, phải thêm `cleaned_title` vào payload cache trước — không thì bất đối xứng quay lại.
+
+## 3. `LLMBadRequestError` — dừng, nhưng không mất báo cáo
+
+Trước: `run()` để lỗi thoát thẳng ra ngoài → dry-run gặp ca này crash hoàn toàn, không còn gì ngoài traceback.
+
+Giờ: `run()` bắt `LLMBadRequestError` quanh đúng lời gọi `parse_tasks`, và **trả về `RunReport`** thay vì raise:
+
+- `plan.ok = False` với một `CheckResult("llm_bad_request", passed=False, severity="error")` → mọi kiểm tra "chạy được không" của caller đều fail như với lịch xấu.
+- `errors = ("llm_bad_request: <type>: <message>",)`, `warnings` nêu rõ "không task nào được xử lý, không chạm calendar".
+- `parse` rỗng, `reconciliation=None`, **không gọi `reconcile` lần nào** → không thể có side effect.
+
+Chọn "trả report có cờ lỗi" thay vì "ghi report rồi raise" vì một hàm không thể vừa trả vừa ném, và trả report giữ được đúng thứ dry-run cần: bảng phân loại + lý do dừng nằm trong cùng một đối tượng. Đánh đổi: caller phớt lờ `report.errors` sẽ không thấy lỗi ồn như một exception — nhưng `plan.ok=False` đã chặn mọi đường ghi, nên hậu quả xấu nhất là chạy không làm gì.
+
+`parse_tasks` **vẫn** để `LLMBadRequestError` thoát ra: bắt ở tầng runner, không bắt ở tầng adapter, để caller khác của `parse_tasks` vẫn thấy lỗi nguyên vẹn.
+
+Bất biến "llm=None không nạp `horae.llm`" vẫn giữ: `run()` tách hai nhánh — `llm is None` gọi thẳng `parse_tasks`, nhánh còn lại mới `from horae.llm.protocol import LLMBadRequestError` (import cục bộ trong nhánh). Đã chạy lại kiểm `sys.modules` sau khi sửa: vẫn rỗng, kể cả khi truyền `store`.
+
+## 4. Nguyên tắc: LLM không được quyết định phân loại
+
+Ghi lại thành nguyên tắc, không chỉ một dòng code, vì module sau của Chiron rất có thể sẽ muốn để LLM phân loại:
+
+> **Nhãn của người dùng quyết định *loại* task; LLM chỉ đóng góp *con số ước lượng*.**
+
+Lý do: `assignment` và `ongoing` có luật phân bổ khác hẳn nhau (một cái chia theo deadline và largest-remainder, một cái ăn phần dư mỗi ngày theo `daily_target_minutes`). Trao quyền định tuyến giữa hai luật đó cho một thành phần phi xác định nghĩa là cùng một task có thể rơi vào hai chế độ phân bổ khác nhau ở hai lần chạy, và người vận hành không có cách nào nhìn báo cáo mà biết vì sao. Ước lượng sai thì lệch vài chục phút và thấy ngay ở cột `source=llm`; phân loại sai thì lệch cả mô hình xếp lịch.
+
+Cụ thể: `ParsedTitle.kind` **không** được đọc trong `parse_tasks`. Nhãn `@ontap` / `@event` là nguồn quyết định duy nhất, và hai nhánh đó `continue` trước khi tới đoạn gọi LLM.
+
+## Kết quả
+
+- 246 test pass (234 cũ + 12 mới). Vẫn không sửa `scheduler_core/`, không sửa `horae/llm/`, không sửa test cũ.
+
+---
+
+# NOTES — Dry-run thật lần 2 (live 2026-09-04, sau khi nối LLM)
+
+Đọc dữ liệu live qua MCP (chỉ thao tác GET: `list_calendars`, `list_events`, `find-tasks`), đưa vào `runner.run(today=2026-09-04, dry_run=True)` qua snapshot reader; writer là `FakeCalendarWriter` để tuyệt đối không POST/DELETE. Script: `scratchpad/dryrun_day2.py`.
+
+## Dữ liệu live
+
+- 6 calendar (lần 1 có 9). `HDT.IE.ADVANCED 32` có mặt và bị bỏ qua theo `IGNORED_CALENDARS`.
+- 26 event trong cửa sổ 2026-09-05 → 2026-09-19; hai calendar ngày lễ **rỗng**, `Auto-Study` **rỗng** (lần 1 có 2 block) → không có `AutoBlock` nào, ledger rỗng, không có gì để xóa.
+- Todoist: 6 task đang mở.
+- Mỗi calendar trả 1 page; recurring instance vẫn có ID `<base>_<timestamp>Z` như lần 1.
+
+## Kết quả
+
+| | |
+|---|---|
+| `plan.ok` | True |
+| `gate_passed` | True (delete=True, create=True) |
+| planned creates | 5 |
+| planned deletes | 0 |
+| check fail | không có |
+| warnings | 0 |
+| `writer.created` / `writer.deleted` | 0 / 0 |
+
+Block dự kiến: LeetCode 45' (09-05 14:00), Vật Lí 30' + LeetCode 45' + IELTS 60' + SAT 60' (09-06).
+
+`shortfall` và `infeasible` = `{6hJV4pQ4J53JgV4V: 60, 6hP6hGrGcp4j7hX3: 90}` — hai task BTVN Hoá, nhưng **hai lý do khác nhau**:
+
+- `6hJV4pQ4J53JgV4V` "Làm BTVN Hoá" hạn **2026-08-28 15:30** — quá hạn thật, 7 ngày.
+- `6hP6hGrGcp4j7hX3` "Làm BTVN Hoá - Đề ôn tập chương 2" hạn **2026-09-04 15:45** — hạn *hôm nay*, chưa quá hạn tại thời điểm chạy (12:23), nhưng vẫn không xếp được vì lịch chỉ bắt đầu từ D1 = today+1.
+
+Lần chạy này gộp cả hai vào `infeasible`. Đó là một **lỗi phân loại thật**, đã vá — xem mục "Tách `overdue` khỏi `infeasible`" bên dưới. Chạy lại cùng snapshot sau khi vá: `overdue=('6hJV4pQ4J53JgV4V',)`, `infeasible=('6hP6hGrGcp4j7hX3',)`.
+
+Đúng như thiết kế: không xếp block, không raise, chỉ nêu trong report.
+
+## Đường LLM KHÔNG được kiểm chứng trong lần này
+
+Hai lý do độc lập, cần ghi rõ để lần 3 không hiểu nhầm là "đã xong":
+
+1. **Cả 6 task đều có `[Nm]` / `[Nm/ngày]` trong tiêu đề** → cột `source` toàn `title`, `parse_title` không được gọi lần nào. Dữ liệu Todoist thật hiện tại không có task tiêu đề tự do nào để LLM chạm vào.
+2. **Không có API key của provider nào trong môi trường** (`env` không có `*_API_KEY` nào liên quan). Dựng `LLMClient` cũng chỉ dẫn tới `NoProviderConfigured`.
+
+Đã chạy hai lần để xác nhận: `llm=None` và `llm=LLMClient(...)` (không key) cho **kết quả bằng nhau từng trường** (`parse`, `blocks`, `estimate_sources`). Nghĩa là việc nối LLM **không làm lệch** kế hoạch trên dữ liệu thật — đó là điều lần này chứng minh được. Việc LLM đoán đúng/sai trên tiêu đề thật thì **chưa** chứng minh được.
+
+`./.horae/llm_cache.json` không được tạo (không có lời gọi nào để cache) — đúng với luật "chỉ ghi cache sau khi JSON hợp lệ".
+
+Muốn kiểm chứng nốt đường LLM ở lần 3: cần (a) một task Todoist thật có tiêu đề tự do không `[Nm]`, và (b) export key của một provider trước khi chạy.
+
+## Cảnh báo thiếu `store` mạnh tới đâu
+
+`ParseResult.warnings` / `RunReport.warnings` là **chuỗi thuần trong báo cáo**, không phải `CheckResult` và **không có `severity`** — hệ severity (`error`/`warning`) chỉ tồn tại trong 12 check của `run_checks`. Vì vậy cảnh báo "LLM được gọi mà không có store" **không** ảnh hưởng `plan.ok`, **không** chặn ghi. Với `dry_run=True` thì vô hại (không ghi gì).
+
+**Đã vá ngay, không hoãn sang bước ghi thật** (xem mục "Cổng `llm_without_store`" dưới đây).
+
+---
+
+# NOTES — Cổng `llm_without_store` (vá trước bước ghi thật)
+
+Lỗ hổng: `llm is not None and store is None and dry_run=False` nghĩa là **ghi lịch thật bằng ước lượng LLM không cache** — mỗi đêm một con số khác cho cùng một task chưa đổi nội dung, và diff/reconcile sẽ thấy tổng phút đổi liên tục nên xóa-tạo lại block không vì lý do thật nào. Cảnh báo chuỗi trong `warnings` không chặn được gì.
+
+Đã vá ngay trong bước này thay vì ghi chú để làm sau, vì đây đúng loại lỗ hổng "đã biết, chưa vá" dễ bị quên đúng lúc bật production.
+
+## Hành vi
+
+`run()` kiểm điều kiện này **trước mọi lời gọi mạng** — trước cả `src.fetch_open_tasks()` — rồi trả `_blocked_report(...)`:
+
+- `plan.ok = False`, `checks = [CheckResult("llm_without_store", passed=False, severity="error")]`
+- `errors = ("llm_without_store: ...",)`, `warnings` nêu "không task nào được xử lý, không chạm calendar"
+- `reconcile` không được gọi → không thể có side effect; `source.fetch_count == 0`, `llm.call_count == 0` (không tốn API call nào của Todoist lẫn provider)
+
+Ba trường hợp KHÔNG bị chặn, có test cho từng cái:
+
+| `llm` | `store` | `dry_run` | kết quả |
+|---|---|---|---|
+| có | không | **False** | **CHẶN** — `errors` có `llm_without_store` |
+| có | có | False | chạy bình thường |
+| có | không | True | chạy bình thường, chỉ có cảnh báo "KHÔNG được cache" |
+| không | không | False | chạy bình thường (đường không-LLM không đổi) |
+
+`_bad_request_report` được tổng quát hoá thành `_blocked_report(today, dry_run, check_name, detail, warning)` dùng chung cho cả hai ca dừng sớm.
+
+Test `test_runner_bad_request_returns_report_without_writing` phải sửa theo: nó chạy `dry_run=False` với `llm` nên giờ cần truyền `store` thật (tempdir) mới tới được nhánh prompt-sai — cổng mới đứng trước. Đây là bằng chứng cổng chạy đúng thứ tự, không phải test bị nới lỏng.
+
+## Kết quả
+
+- 248 test pass (234 cũ + 14 mới).
+
+---
+
+# NOTES — Tách `overdue` khỏi `infeasible`
+
+## Vấn đề
+
+`build_plan` cũ tính `infeasible` bằng đúng một luật:
+
+```python
+task_days = [d for d in sorted_dates if d <= a.deadline.date()]   # sorted_dates bắt đầu từ D1
+if a.remaining_minutes > sum(capacity của task_days): infeasible
+```
+
+Vì `sorted_dates` bắt đầu từ D1 = today+1, **mọi task có deadline ≤ hôm nay đều cho `task_days` rỗng → capacity 0 → luôn `infeasible`**. Nhãn đó gộp hai tình huống rất khác nhau:
+
+- Task **đã trễ thật** (hạn 7 ngày trước) — hệ thống không làm gì được, người dùng phải dọn Todoist.
+- Task **hạn trong hôm nay, chưa tới giờ** — chưa trễ, chỉ là lịch không xếp cho hôm nay. Đây là chuyện thường xuyên (bài nộp trong ngày), không phải ca hiếm.
+
+Nguy hiểm ở giai đoạn ghi thật: đọc `infeasible` như "bất khả thi" sẽ khiến người vận hành hoặc logic sau bỏ qua một task thực ra hoàn toàn bình thường.
+
+## Luật mới
+
+`build_plan(..., now: datetime | None = None)`:
+
+| điều kiện | nhãn | hành động |
+|---|---|---|
+| `deadline <= now` | `overdue_task_ids` | người dùng dọn Todoist (tick xong / dời hạn) |
+| `deadline > now` nhưng `remaining > capacity trước hạn` | `infeasible_task_ids` | cảnh báo sớm: sắp trễ nếu không can thiệp |
+| còn lại | không nhãn | bình thường |
+
+Hai nhãn **loại trừ nhau**: task đã `overdue` thì `continue`, không xét capacity nữa.
+
+"Quá hạn" so với **thời điểm chạy**, không so với D1 — đúng yêu cầu. Task hạn 15:45 hôm nay, chạy lúc 12:23, là `infeasible` (chưa trễ, nhưng không còn ô nào trước hạn), không phải `overdue`.
+
+## `now` và tính thuần của lõi
+
+`scheduler_core` không được đọc đồng hồ hệ thống (nguyên tắc từ Part 1A), nên `now` do caller truyền vào, đồng nhất với cách `reconcile` đã làm. `now=None` → lấy **00:00 của `today`** theo tz config.
+
+Hệ quả có chủ đích của `now=None`: task hạn sớm hơn trong chính hôm nay (vd 09:00, chạy lúc 12:23) sẽ vào `infeasible` chứ không phải `overdue`, vì lõi không biết mấy giờ. Muốn phân loại chính xác theo giờ thì truyền `now` — `runner.run()` đã có sẵn tham số `now` và giờ chuyển tiếp nó xuống `build_plan` (trước đây chỉ đưa cho `reconcile`).
+
+## Thay đổi kèm theo
+
+- `PlanResult.overdue_task_ids: tuple[str, ...] = ()` — có default nên mọi chỗ dựng `PlanResult` cũ (test, `_blocked_report`) không phải sửa.
+- `RunReport.overdue_task_ids` — property đọc thẳng từ plan, để báo cáo dry-run in được ngay.
+- Đây là lần đầu task này chạm `scheduler_core/` (các bước trước cấm). Người dùng yêu cầu tách nhãn "không chỉ trong NOTES mà trong code", và luật phân loại nằm trong `build_plan` nên không có chỗ nào khác để sửa cho đúng.
+
+## Kết quả
+
+- 253 test pass (234 cũ + 19 mới). 5 test mới cho riêng phần tách nhãn, gồm cả ca `now=None`.
+- Chạy lại snapshot live 2026-09-04: `overdue=('6hJV4pQ4J53JgV4V',)` (hạn 28/08, quá hạn thật), `infeasible=('6hP6hGrGcp4j7hX3',)` (hạn 15:45 hôm nay). Kế hoạch, gate, số block không đổi.
+
+## Cảnh báo `now=None` (bổ sung)
+
+`run()` mặc định `now=None` — snippet ví dụ có truyền `now`, nhưng bản thân hàm thì không ép. Người vận hành gọi `run()` mà quên `now` sẽ im lặng nhận **hai** hậu quả, không chỉ một:
+
+1. Nhãn `overdue`/`infeasible` tính theo 00:00 ngày chạy → task hạn sớm hơn trong chính hôm nay hiện sai nhãn. Sai lệch **có hệ thống** với mọi lần chạy buổi chiều/tối.
+2. Nặng hơn: `reconcile` chỉ chạy kiểm *"replacement delete bị chặn vì block đã bắt đầu"* khi `now is not None` (`reconcile.py:735`). Với `now=None`, cơ chế chống xóa block đang chạy dở **bị bỏ qua hoàn toàn**.
+
+Đã thêm cảnh báo trong `run()` khi `now is None`, nêu cả hai hậu quả. Cảnh báo phát ở mọi chế độ (kể cả `dry_run=True`) vì hậu quả 1 ảnh hưởng đúng thứ người vận hành đang đọc.
+
+Sau đó **đã nâng thành cổng chặn** theo yêu cầu người dùng — xem mục dưới.
+
+---
+
+# NOTES — Cổng `now_required_for_write`
+
+## Hợp đồng mới
+
+**`now` là bắt buộc khi ghi thật (`dry_run=False`), vì nó bảo vệ cơ chế không-xóa-block-đã-bắt-đầu.**
+
+Đây là lý do thật, không phải nhãn hiển thị. `reconcile.py:735` là `if now is not None:` và **không có nhánh else**: với `now=None`, vòng kiểm "replacement delete bị chặn vì `block.start <= now`" không chạy dòng nào. Một block `[Auto]` đang chạy dở có thể bị xóa mà không có gì cản.
+
+Hai hậu quả của cùng một tham số mặc định trông giống nhau tại điểm gọi hàm nhưng khác hẳn về mức nguy hiểm:
+
+| hậu quả | mức |
+|---|---|
+| nhãn `overdue`/`infeasible` tính theo 00:00 ngày chạy | hiển thị sai |
+| `reconcile` bỏ kiểm "block đã bắt đầu" | **có thể xóa dữ liệu chưa nên xóa** |
+
+## Hành vi
+
+Cùng mẫu với `llm_without_store`: kiểm **trước mọi lời gọi mạng**, trả `_blocked_report`, `plan.ok=False`, `errors` có `now_required_for_write: ...`, `reconcile` không được gọi, `writer` sạch, `source.fetch_count == 0`.
+
+| `dry_run` | `now` | kết quả |
+|---|---|---|
+| False | None | **CHẶN** |
+| False | có | chạy bình thường |
+| True | None | chạy, chỉ cảnh báo `now=None: ...` |
+| True | có | chạy, không cảnh báo |
+
+Hai cổng cấu hình hiện có, cùng chạy trước mạng: `llm_without_store` rồi `now_required_for_write`.
+
+## 12 call site test cũ phải sửa
+
+Mọi `run(..., dry_run=False)` trong `test_runner.py` giờ truyền `now=NOW` (`NOW = 12:00 ngày chạy`). Đây là **cập nhật theo hợp đồng mới, không phải nới lỏng test**: chọn trưa ngày chạy nên mọi block (đều ở D1 trở đi) vẫn `block.start > now` → kiểm "đã bắt đầu" cho cùng kết quả như trước, không test nào đổi ý nghĩa.
+
+## Vì sao làm ngay thay vì đợi bước bật `dry_run=False`
+
+Lý lẽ của người dùng, ghi lại vì nó áp cho cả các bước sau: bước "bật ghi thật lần đầu" nghe như một cột mốc rõ ràng, nhưng thực tế nó thường đến dưới dạng "thử nhanh xem sao" giữa lúc đang làm việc khác — và lúc đó không ai nhớ phải chặn. **Vá trước khi cần, không vá đúng-lúc-cần.** Cùng lý do đã áp cho cổng `llm_without_store`.
+
+## Kết quả
+
+- 255 test pass (234 cũ + 21 mới).
+
+---
+
+# NOTES — Smoke test provider thật cho `parse_title` sau khi nối (DeepSeek, 2026-09-04)
+
+Điều kiện bắt buộc đã ghi ở Task 2B ("mọi module gọi LLM cần một lần smoke test với provider thật") — lần này áp cho **đường đã nối**, không phải cho `parse_title` đứng riêng.
+
+Cấu hình: `LLMClient(LLMConfig(providers=(ProviderConfig("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),)))`, `store=LocalStore("./.horae")`, gọi qua `parse_tasks`.
+
+Đầu vào: tiêu đề **thật** của task Todoist mới `6hQhmJ7WWc8JP5xV` — "Nhắn tin với ny" — gắn thêm due date để nó thành Assignment.
+
+| điểm cần kiểm | kết quả |
+|---|---|
+| `source="llm"` xuất hiện đúng task | ✅ `TaskClassification(..., estimate_minutes=15, source='llm')` |
+| số phút hợp lý | ✅ 15' cho "nhắn tin" — hợp lý |
+| lần hai không tốn API call | ✅ lần 1: **1.09s**, lần 2: **0.00s**, kết quả giống hệt từng trường |
+
+`./.horae/llm_cache.json` sau lần 1:
+
+```json
+{ "0b8f914a463a6699": { "estimate_minutes": 15, "kind": "assignment",
+                        "cached_at": "2026-09-04T11:56:17.750327+00:00" } }
+```
+
+Đây là bằng chứng cache triệt tiêu lời gọi lặp trên **dữ liệu thật + provider thật**, khác với test 54 (fake provider). Chênh lệch 1.09s → 0.00s là dấu hiệu không thể nhầm.
+
+## Chặn còn lại: task tự do KHÔNG có due date thì không tới được LLM
+
+Task `6hQhmJ7WWc8JP5xV` trên Todoist thật **không có due date**. Trong `parse_tasks`, nhánh `raw.due is None` `continue` trước cả đoạn trích thời lượng (diễn giải số 2 của bước nối: không có deadline thì không dựng được `Assignment`, gọi LLM cho một task sắp bị bỏ là phí). Nên chạy live hôm nay, LLM **không được gọi lần nào** và task đó chỉ hiện trong `warnings`.
+
+Muốn dry-run ngày mai đi qua đường LLM thật: **task tự do phải có due date**.
+
+## Sửa kèm: câu cảnh báo "không có due date" nói sai
+
+Câu cũ: `task {id}: có [Nm] nhưng không có due date → không tạo Assignment` — nhưng nhánh này bắt **mọi** task thiếu due, kể cả task không hề có `[Nm]`. Đọc report live hôm nay thì thấy ngay nó mô tả sai chính task đang bị bỏ. Câu mới nêu đúng lý do và nói rõ LLM cũng không được hỏi.
+
+## Quan sát: nhãn `overdue` tự đổi đúng theo thời gian
+
+Task `6hP6hGrGcp4j7hX3` hạn 15:45 hôm nay: lần chạy 12:23 → `infeasible`; lần chạy 18:56 → `overdue`. Cùng dữ liệu, khác `now`. Đúng như thiết kế tách nhãn, và là bằng chứng `now` được dùng thật chứ không phải trang trí.
+
+---
+
+# NOTES — Dry-run 2/3 (chuỗi mới), live 2026-09-05 — đường LLM chạy hết end-to-end
+
+Khác với smoke test hôm qua (chỉ chạm `parse_tasks`), lần này đường LLM đi **hết chuỗi thật**: `parse_tasks → build_plan → cut_blocks → run_checks → reconcile`, vì task tự do "Dọn bàn" (`6hQmg444wHqvJ3p3`) giờ có due date (2026-09-07, nằm trong write window D1/D2).
+
+Cấu hình: `LLMClient(deepseek-chat)`, `store=./.horae`, `writer=FakeCalendarWriter` (tuyệt đối không POST/DELETE), `now` = thời điểm chạy thật.
+
+## Ba điểm hẹn kiểm — cả ba đạt
+
+| điểm | kết quả |
+|---|---|
+| `source=llm` đúng task | ✅ `6hQmg444wHqvJ3p3 → estimate_minutes=15, source='llm'` |
+| số phút hợp lý | ✅ 15' cho "Dọn bàn" |
+| lần hai không tốn API call | ✅ lần 1: **0.53s**, lần 2: **0.00s**; `estimate_sources`/`plan.blocks` giống hệt |
+
+## Phát hiện thật: ước lượng LLM 15' thấp hơn sàn `block_min_minutes=30`
+
+`plan.ok=False`. `cut_blocks` vẫn cắt được block 15' (đúng bằng `estimate_minutes`), nhưng `run_checks` bắt đúng: `block_size: Dọn bàn: 15' ngoài [30', 90']`. `PRESET_STUDENT_VN.blocks.min_minutes = 30`.
+
+Đây **không phải lỗi của việc nối LLM** — là hệ quả có thật của việc LLM tự do ước lượng cho một task rất nhỏ ("dọn bàn" đáng giá 15'), va vào một ràng buộc có sẵn từ Part 1D (`block_min_minutes`), độc lập với LLM. Đúng cách gate được thiết kế để làm: `plan.ok=False` → không viết gì (`gate_create=False`), an toàn. Với `dry_run=True` thì vô hại; với `dry_run=False` thì `plan.ok=False` cũng chặn y hệt (`reconcile.py` đã có sẵn `if plan is not None and not plan.ok: add_global_gate_error(...)`).
+
+**Không sửa gì** — ngoài phạm vi task này (không được sửa `scheduler_core/validate.py`/`blocks.py`, và bản thân hành vi này là đúng thiết kế). Ghi lại để người dùng biết: **task rất nhỏ (< 30 phút) mà để LLM tự đoán sẽ luôn chặn plan**, vì không có luật nào ép ước lượng LLM làm tròn lên `block_min_minutes`. Cách né: cho task nhỏ một `[Nm]` tường minh trong tiêu đề (regex thắng, LLM không được hỏi) — hoặc coi đây là việc cần bàn riêng nếu muốn LLM tự làm tròn.
+
+## Hai lỗi trong `errors` — cùng nguồn, không phải hai lỗi độc lập
+
+```
+errors: ("block_size: Dọn bàn: 15' ngoài [30', 90']",
+         'không xác định được calendar_id chính xác của Auto-Study')
+```
+
+Lỗi thứ hai là hệ quả downstream của lỗi thứ nhất, không phải một bug mới: `reconcile.py` có `if plan is not None and not plan.ok: target_id, writer_name, gate_errors = requested_id, None, []` — khi `plan.ok=False`, `reconcile` **cố tình bỏ qua** việc resolve calendar thật của writer (tránh gọi thêm khi đã biết sẽ không ghi), nên `target_id=None` và câu thông báo "không xác định được calendar_id" luôn xuất hiện kèm theo bất cứ khi nào `plan.ok=False` và có `planned_creates`. Đây là hành vi đã có từ Task 3B, nằm trong `reconcile.py` — không chạm trong task này.
+
+## Kết luận
+
+Đường LLM đã được xác nhận đầy đủ trên dữ liệu thật + provider thật + toàn bộ chuỗi (không chỉ `parse_tasks`). Khoảng trống cuối cùng nêu ở các lượt review trước đã khép.
+
