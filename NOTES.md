@@ -1156,3 +1156,102 @@ Vòng kiểm `if now is not None: for block in planned_deletes: if id(block) not
 
 Bug 2 (và Bug 1, xem mục riêng) đến từ một tài liệu kế hoạch người dùng dán trực tiếp vào chat, tự mô tả là do một "review sâu" trước đó tạo ra và tham chiếu tới `claude/review-horae-deep-2026-09-05.md`, `claude/plan-fix-horae-2bugs-2026-09-05.md`, và `fuzz_allocate_reference.py` "đính kèm". Đã tìm trên toàn bộ filesystem (repo, mọi thư mục scratchpad phiên trước, `~/Downloads`) — **cả ba file đều không tồn tại**, không có gì được đính kèm thật. Với Bug 2, chẩn đoán trong spec khớp chính xác với code thật khi tự đọc độc lập (không có gì cần nghi ngờ). Với Bug 1, spec dựa vào kết quả cụ thể của `fuzz_allocate_reference.py` (số lần thử, số counterexample) làm tiêu chí "xong" — file đó không có nên chưa thể tuyên bố đạt tiêu chí đó; xem mục Bug 1 bên dưới.
 
+---
+
+# NOTES — Bug 1: `_place_min_blocks`/`_cleanup_min` force-fit — lưới an toàn ở `_allocate_branch_a`
+
+Giao việc từ cùng spec bên ngoài đã nêu ở mục Bug 2 (dán vào chat, không phải file đính kèm — xem "Nguồn của spec" ở mục Bug 2, áp dụng y hệt cho mục này).
+
+## Đã verify độc lập trước khi sửa (không tin theo con số của spec)
+
+Đọc trực tiếp `scheduler_core/allocate.py` xác nhận cả 3 điểm force-fit trong `_place_min_blocks` (dòng ~121-124, ~137-142, ~137-139 cũ) và việc `_cleanup_min` cộng thẳng `placed[d]` vào `minutes[d]` không kiểm tổng — khớp chính xác mô tả trong spec.
+
+Sau đó tự viết một fuzzer độc lập (không dùng bất kỳ số liệu nào từ spec) chạy `_allocate_branch_a` trực tiếp:
+
+- 20.000 trial đầu (fc cố định `min_minutes=30, unit=15`, 1-5 ngày): **20 vi phạm INV1** (`0 < minutes[d] < min_minutes`) trong 20 trial đầu tiên tìm được — bug có thật, tần suất cao, không phải trường hợp hiếm.
+- Mở rộng 4 seed × 20.000 trial (`min_minutes`/`unit` ngẫu nhiên, 1-10 ngày, fc 0-200): tất cả đều ra vi phạm INV1 trước khi sửa.
+- **Phát hiện khác với spec**: tìm riêng vi phạm INV2 (vượt fc) trong 200.000 trial trước khi sửa — **0 vi phạm**. Vòng "clip" đã có sẵn ở cuối `_allocate_branch_a` (`if minutes[d] > fc[d]: minutes[d] = fc[d]`) chạy SAU `_cleanup_min` nên đã luôn dọn sạch phần vượt fc trước khi trả về — INV2 chưa từng thực sự bị vi phạm ở đầu ra cuối cùng, dù `_place_min_blocks`/`_cleanup_min` có thể tạo giá trị trung gian vượt fc. Chỉ **INV1** là bug sống thật ở tầng contract của `_allocate_branch_a`. Ghi lại vì đây là điểm spec mô tả rộng hơn thực tế — không phải sai, chỉ là chưa hẹp đúng phạm vi.
+
+## Hướng đã chọn: **Hướng B** (chốt chặn tập trung ở `_allocate_branch_a`)
+
+Không sửa `_place_min_blocks`/`_cleanup_min`. Lý do chọn B thay vì A:
+
+- `_place_min_blocks` được gọi từ 3 nhánh khác nhau trong `_cleanup_min` (zero_days / survivor_room / fallback toàn cục) — sửa tận gốc nghĩa là phải suy luận lại tính đúng đắn ở cả 3 điểm gọi cùng lúc, tăng diện tích rủi ro ở một module đã có lịch sử bug ẩn (đúng nhận định của spec).
+- Contract cần đúng là ở **đầu ra cuối cùng** của `_allocate_branch_a` (đây là hàm duy nhất được `allocate_assignments` gọi trực tiếp) — không cần mọi hàm nội bộ đều "sạch" ở từng bước trung gian.
+- Một chốt chặn tập trung, có docstring giải thích rõ, dễ viết test phá hoại độc lập cho riêng nó (đúng như spec dự đoán).
+
+Đánh đổi đã chấp nhận: nợ kỹ thuật ở `_place_min_blocks`/`_cleanup_min` vẫn còn (logic nội bộ vẫn có thể tạo giá trị trung gian sai, chỉ là không còn lọt ra ngoài).
+
+## Cài đặt: `_enforce_min_or_zero`
+
+Thêm hàm mới, gọi ở cuối `_allocate_branch_a` sau vòng clip+redistribute hiện có (giữ nguyên, không sửa). Với mỗi ngày còn vi phạm `0 < minutes[d] < min_minutes`: thử dồn sang một ngày KHÁC còn đủ `fc` để đạt `>= min_minutes` sau khi cộng; không ngày nào nhận được thì đặt về 0. Chỉ DI CHUYỂN hoặc XÓA, không cộng thêm tổng (giữ INV3). Lặp tới `len(days)+2` lần (khớp phong cách phòng thủ đã có trong `_cleanup_min`), dù phân tích cho thấy một vòng thường đã đủ (vi phạm có thể "gộp" vào nhau vì đọc `minutes[e]` LIVE, không phải ảnh chụp).
+
+## Test bắt buộc
+
+- `tests/test_allocate.py`: 4 test mới — `test_31_single_day_below_min_leftover_not_forced`, `test_32_leftover_dropped_when_no_day_has_room`, `test_33_every_day_below_min_all_shortfall` (3 case cố định, rút gọn từ fuzz sweep), và `test_34_invariant_block_size_holds_across_large_random_sweep` (property-based, seed cố định 12345, 1000 trial — không dùng `hypothesis` vì dự án chưa có dependency đó, đúng lựa chọn "vòng lặp random-seed-cố-định" mà spec cho phép).
+- **Xác nhận cả 4 test không vô nghĩa**: tạm vô hiệu hoá lời gọi `_enforce_min_or_zero` (không sửa file thật, chỉ patch tạm để kiểm), chạy lại 4 test → **cả 4 đều fail** đúng như kỳ vọng, kèm counterexample cụ thể bắt được bởi `test_34`. Khôi phục ngay sau đó, chạy lại toàn bộ suite xanh.
+- `fuzz_allocate_reference.py` (repo root): oracle độc lập, **tự viết lại từ đầu** vì file gốc không tồn tại (xem "Nguồn của spec"). Bám đúng 4 bất biến INV1-INV4 mà spec định nghĩa bằng lời. Chạy `.venv/bin/python fuzz_allocate_reference.py` → `0 failing` (3/3 `KNOWN_REGRESSIONS` + 20.000 trial fuzz seed 12345).
+- Toàn bộ 261 test (257 + 4) xanh, không có test cũ nào phải đổi kỳ vọng — `_allocate_branch_a`/`allocate_assignments` chưa từng có test giả định hành vi force-fit sai, nên không có gì phải sửa ngược.
+
+## Xác nhận pipeline dry-run (criterion 5) — và một phát hiện quan trọng cần tách bạch
+
+Ghép `allocate_assignments → cut_blocks → run_checks` cho scenario `test_31` (108' trên 3 ngày, một ngày dust 18'): **`block_size` không còn nằm trong danh sách check fail** — trước bản sửa, 18' sẽ bị ép thành một block < 30' và bị `block_size` bắt lỗi, làm `plan.ok=False` lan ra toàn bộ kế hoạch (đúng cơ chế đã quan sát trong dry-run 2/3 hôm nay với "Dọn bàn"). Sau bản sửa: 18' rơi thành `shortfall`, không có block nào < 30' được tạo, `block_size` sạch.
+
+**Nhưng: task "Dọn bàn" (15') trong dry-run 2/3 hôm nay sẽ KHÔNG được Bug 1 sửa.** Đã verify: với `remaining=15`, `PRESET_STUDENT_VN.small_task_threshold=90` (15 ≤ 90, không kích hoạt nhánh A theo luật "remaining > threshold"), và `days_until=1 ≤ small_task_deadline_days=7` → task này đi qua **`_allocate_branch_b`**, không phải `_allocate_branch_a`. Bug 1 (đúng phạm vi spec giao: `_place_min_blocks`/`_cleanup_min`, chỉ được gọi từ nhánh A) không chạm nhánh B.
+
+Đọc lại `_allocate_branch_b`:
+
+```python
+for d, cap in day_fc:
+    if cap >= remaining:
+        minutes[d] = remaining   # KHÔNG kiểm remaining >= min_minutes
+        return minutes
+```
+
+Đường "vừa gọn trong một ngày" (`cap >= remaining`) gán thẳng `remaining` mà không kiểm `remaining >= min_minutes` — đây là một defect CÙNG LOẠI (force-fit dưới sàn kích thước) nhưng ở MỘT ĐOẠN CODE KHÁC, hoàn toàn không được nhắc tới trong spec Bug 1 (spec chỉ nói `_place_min_blocks`/`_cleanup_min`). Đây chính là cơ chế thật gây ra `block_size` fail cho "Dọn bàn" trong dry-run 2/3 — không phải Bug 1.
+
+**Không sửa trong lần này** — đúng chỉ dẫn của spec ("không được gộp code fix vào cùng một đổi thay đổi với Bug 1") và đúng bản chất: đây chính là một biến thể của vấn đề "task nhỏ hơn `min_minutes` ngay từ đầu" mà spec đã cố ý hoãn quyết định (a)/(b)/(c) sang sau khi Bug 1 xong. Phát hiện này nên được đưa vào việc chốt quyết định đó — phạm vi vấn đề rộng hơn một chút so với mô tả ban đầu (không chỉ là "làm tròn ước lượng LLM", mà là chính `_allocate_branch_b` thiếu kiểm `min_minutes` ở đường nhanh).
+
+## Kết quả
+
+- 261 test pass (257 sau Bug 2 + 4 mới cho Bug 1).
+- `fuzz_allocate_reference.py` (tự viết, không phải file gốc): `0 failing`.
+- "Dọn bàn" trong dry-run 2/3 vẫn sẽ hiện `block_size` fail nếu chạy lại — đây là hành vi ĐÚNG và ĐÃ BIẾT (do `_allocate_branch_b`, ngoài phạm vi Bug 1), không phải Bug 1 chưa sửa hết.
+
+---
+
+# NOTES — File gốc đã tới: xác nhận lại Bug 1 bằng oracle THẬT + phát hiện thêm từ review
+
+Giữa lúc soạn báo cáo trên, ba file trước đó không tìm thấy ở đâu (`fuzz_allocate_reference.py`, `review-horae-deep-2026-09-05.md`, `plan-fix-horae-2bugs-2026-09-05.md`) xuất hiện trong `handoff-2026-09-05/` ở gốc repo — rõ ràng đồng bộ từ máy/phiên khác sau khi báo cáo trước được gửi. Đã đọc cả ba, xác nhận lại mọi thứ bằng file thật thay vì bản tự viết.
+
+## Bug 1 — oracle THẬT xác nhận `0 failing`
+
+```
+.venv/bin/python fuzz_allocate_reference.py
+branch_a: 20000 trials, 0 failing
+```
+
+Cả 3 `KNOWN_REGRESSIONS` **thật** (khác với 3 case tôi tự tìm trước đó):
+
+| total | day_fc | min | unit | kết quả sau sửa |
+|---|---|---|---|---|
+| 12 | `{0: 29}` | 25 | 10 | `{0: 0}` — 12' không đủ tạo block, bỏ hẳn |
+| 103 | `{0:31,1:31,2:35,3:0,4:45}` | 30 | 15 | `{0:31,1:0,2:30,3:0,4:42}` — sum=103, không rơi phút nào |
+| 268 | `{0:20,1:90,2:40,3:120}` | 20 | 15 | `{0:0,1:90,2:40,3:120}` — sum=250, shortfall=18 |
+
+Đã copy file gốc vào repo root (thay bản tự viết trước đó), và thêm `test_35`-`test_37` vào `tests/test_allocate.py` dùng ĐÚNG 3 bộ số này (không đổi), cộng `test_38_original_oracle_zero_failing` chạy chính oracle gốc như một module trong pytest để nó nằm trong CI thay vì chỉ chạy tay. Giữ nguyên `test_31`-`test_34` (tự tìm trước đó, vẫn hợp lệ, thêm phủ ngoài 3 case chính thức). **265 test pass** (261 + 4).
+
+Case `total=12` khớp chính xác cơ chế review đã trace tay: nhánh `total < min_minutes` của `_place_min_blocks` gán thẳng, và vì `fc=29 >= 12` nên vòng clip-theo-capacity không bắt được — bug chỉ lộ qua bất biến KÍCH THƯỚC, không phải TRÀN CAPACITY. Đúng khớp với phát hiện độc lập của tôi ở mục Bug 1 phía trên (INV2 chưa từng vỡ ở đầu ra cuối, chỉ INV1 vỡ).
+
+## Điểm review nêu nhưng KHÔNG sửa (đúng đánh giá "mức độ nghiêm trọng thấp" của review, ngoài phạm vi giao việc)
+
+**Mục 3 của review — `parse_title.py` cache thiếu `cleaned_title`, còn sót MỘT lần lệch.** Lần gọi LLM đầu tiên (chưa có cache) trả `cleaned_title` do LLM làm sạch; mọi lần cache-hit sau đó trả `raw`. Đây là hệ quả trực tiếp của quyết định đã ghi ở bước nối LLM ("LLM chỉ đóng góp `estimate_minutes`, tiêu đề luôn giữ nguyên bản gốc") — nhưng quyết định đó áp dụng ở tầng `_estimate_via_llm` (`parsing.py`), trong khi `parse_title.py` tự thân (khi được gọi trực tiếp, không qua `parsing.py`) vẫn còn đường trả `cleaned_title` từ LLM ở lần đầu. Review tự đánh giá "ảnh hưởng chỉ ở tiêu đề hiển thị, không chạm dedup/reconcile (dựa vào `TODOIST_ID_PREFIX`), ghi nhận để biết, không cần ưu tiên" — đồng ý, không nằm trong 2 bug được giao, không sửa.
+
+**Mục 4, 5 của review — xác nhận sạch, khớp với các lần verify trước đó của tôi**: hai cổng `llm_without_store`/`now_required_for_write` chạy trước lời gọi mạng đầu tiên (đã tự verify khi cài đặt cổng, review xác nhận lại độc lập); `verify.py` không import `capacity.py`, test AST đọc file thật qua `Path(__file__)` (đã có từ trước, không phải việc của phiên này). Không có hành động.
+
+## Kết quả cuối
+
+- **265 test pass** (234 gốc + 31 từ các bước LLM/gate/overdue trước đó trong ngày + 4 Bug 1 bổ sung sau khi có oracle thật).
+- `fuzz_allocate_reference.py` ở repo root giờ là **file gốc thật**, không phải bản tự viết.
+- Bug 1 + Bug 2: cả hai đã sửa, verify bằng oracle/test thật, sẵn sàng cho bước tiếp theo (bật ghi thật) về mặt hai bug này.
+

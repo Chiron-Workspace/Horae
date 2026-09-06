@@ -406,3 +406,181 @@ def test_30_min_blocks_prefer_earliest_days():
     result = allocate_assignments([task], caps, DEFAULT_CONFIG)
     task_days = _task_days(result, "t1")
     assert task_days == [days[0], days[1]]  # ngày sớm nhất, không phải ngày fc cao
+
+
+# ---------------------------------------------------------------- bất biến kích thước block (Bug 1)
+#
+# `_place_min_blocks`/`_cleanup_min` có thể để lọt phần dư `0 < x < min_minutes`
+# ra khỏi các vòng redistribute nội bộ. `_allocate_branch_a` phải đảm bảo mọi
+# ngày trong kết quả cuối cùng chỉ nhận 0' hoặc >= min_minutes' — không có giá
+# trị trung gian nào, vì đó không phải là một block hợp lệ (`cut_blocks` sẽ
+# tạo ra block dưới sàn `block_min_minutes`, và `run_checks` sẽ bắt lỗi
+# `block_size` cho MỌI task khác dùng chung kế hoạch, không chỉ task đang xét
+# — hiệu ứng lan rộng đã quan sát được khi chạy dry-run trên dữ liệu thật).
+# Ba scenario dưới đây tìm được bằng fuzzing 80.000 trial ngẫu nhiên
+# (`_allocate_branch_a` gọi trực tiếp, nhiều seed/min_minutes/unit khác nhau)
+# rồi rút gọn về kích thước tối thiểu để dễ đọc.
+
+
+def test_31_single_day_below_min_leftover_not_forced():
+    """3 ngày fc=[60,30,25], estimate=108. Ngày cuối chỉ còn dư 18' sau khi
+    2 ngày đầu nhận đủ min — 18' < min=30 VÀ không ngày nào khác còn chỗ để
+    nhận thêm (2 ngày đầu đã kín). Trước bản sửa: 18' bị ép thẳng vào ngày
+    thứ 3 (fc=25, dư 18 < 25 nên còn "vừa" về capacity nhưng vẫn là một
+    block vô nghĩa < min). Sau bản sửa: 18' KHÔNG được xếp, trồi lên đúng
+    thành shortfall — capacity thật của ngày 3 (25') để dành nguyên vẹn."""
+    days = [MON, TUE, WED]
+    caps = {MON: _cap(MON, 60), TUE: _cap(TUE, 30), WED: _cap(WED, 25)}
+    task = _assignment("t1", WED, 108)
+    result = allocate_assignments([task], caps, DEFAULT_CONFIG)
+    alloc = {d: result.get(d, {}).get("t1", 0) for d in days}
+    assert alloc == {MON: 60, TUE: 30, WED: 0}
+    for d in days:
+        assert alloc[d] == 0 or alloc[d] >= 30, f"{d}: {alloc[d]}' vi phạm min_minutes"
+    assert _sum_task(result, "t1") == 90
+    assert result.shortfall.get("t1", 0) == 18
+
+
+def test_32_leftover_dropped_when_no_day_has_room():
+    """3 ngày fc=[40,30,90], estimate=131. Sau khi đặt 30' ở ngày 1 và ngày
+    2, phần dư 15' không đủ chỗ ở BẤT KỲ ngày nào (ngày 1 còn dư 10' <15,
+    ngày 2 đã kín, ngày 3 đã lấy 86' chỉ còn dư 4' <15). Trước bản sửa: 15'
+    bị cộng thẳng vào ngày đã có min mà không kiểm capacity còn lại. Sau bản
+    sửa: 15' bị bỏ, thành shortfall — không ngày nào vượt fc của nó."""
+    days = [MON, TUE, WED]
+    caps = {MON: _cap(MON, 40), TUE: _cap(TUE, 30), WED: _cap(WED, 90)}
+    task = _assignment("t1", WED, 131)
+    result = allocate_assignments([task], caps, DEFAULT_CONFIG)
+    alloc = {d: result.get(d, {}).get("t1", 0) for d in days}
+    for d in days:
+        assert alloc[d] == 0 or alloc[d] >= 30, f"{d}: {alloc[d]}' vi phạm min_minutes"
+        assert alloc[d] <= caps[d].capacity_minutes, f"{d}: vượt fc"
+    assert _sum_task(result, "t1") == 116
+    assert result.shortfall.get("t1", 0) == 15
+
+
+def test_33_every_day_below_min_all_shortfall():
+    """4 ngày, MỌI ngày đều có fc < min_minutes (25, 29, 25, 25' so với
+    min=30) — không ngày nào có thể chứa dù chỉ một block hợp lệ. Trước bản
+    sửa: `_place_min_blocks`/`_cleanup_min` vẫn ép rải phần dư vào một ngày
+    bất kỳ (\"total < min_minutes → đặt hết vào ngày có fc lớn nhất\", bất kể
+    ngày đó có tạo được block hợp lệ hay không). Sau bản sửa: TOÀN BỘ
+    estimate rơi thành shortfall, không ngày nào nhận gì."""
+    days = [MON, TUE, WED, THU]
+    caps = {MON: _cap(MON, 25), TUE: _cap(TUE, 29), WED: _cap(WED, 25), THU: _cap(THU, 25)}
+    task = _assignment("t1", THU, 103)
+    result = allocate_assignments([task], caps, DEFAULT_CONFIG)
+    for d in days:
+        assert result.get(d, {}).get("t1", 0) == 0
+    assert _sum_task(result, "t1") == 0
+    assert result.shortfall.get("t1", 0) == 103
+
+
+def test_34_invariant_block_size_holds_across_large_random_sweep():
+    """Property-based (seed cố định, không phải hypothesis — dự án chưa có
+    dependency đó): với MỌI (total, day_fc, min_minutes, unit) ngẫu nhiên,
+    `_allocate_branch_a` không bao giờ trả về một ngày có 0 < phút < min, và
+    không bao giờ vượt fc của ngày đó. Đây là lớp bug "đúng số học, sai ràng
+    buộc kích thước" (Bug 1) — 20.000 trial/seed × 4 seed đã chạy khi review,
+    bản trong bộ test dùng seed nhỏ hơn để không làm CI chậm."""
+    import random as _random
+    from scheduler_core.allocate import _allocate_branch_a
+
+    base = MON
+    rng = _random.Random(12345)
+    for _ in range(1000):
+        ndays = rng.randint(1, 6)
+        min_minutes = rng.choice([15, 30, 45, 60])
+        unit = rng.choice([5, 10, 15, 30])
+        days = [base + timedelta(days=i) for i in range(ndays)]
+        fc = {d: rng.randint(0, 200) for d in days}
+        total = rng.randint(0, 500)
+        day_fc = [(d, fc[d]) for d in days]
+        result = _allocate_branch_a(total, day_fc, unit, min_minutes)
+        for d in days:
+            v = result[d]
+            assert v == 0 or v >= min_minutes, (
+                f"seed=12345 total={total} min={min_minutes} unit={unit} "
+                f"day_fc={day_fc} -> {result}: {d}={v} vi phạm min_minutes"
+            )
+            assert v <= fc[d], (
+                f"seed=12345 total={total} min={min_minutes} unit={unit} "
+                f"day_fc={day_fc} -> {result}: {d}={v} vượt fc={fc[d]}"
+            )
+        assert sum(result.values()) <= total, (
+            f"seed=12345 total={total} day_fc={day_fc} -> {result}: tự sinh phút"
+        )
+
+
+# ---------------------------------------------------------------- 3 case chính thức
+# từ review-horae-deep-2026-09-05.md / fuzz_allocate_reference.py (oracle gốc, xác
+# nhận lại sau khi file đó thực sự tới tay — xem NOTES.md). Gọi thẳng
+# `_allocate_branch_a` với ĐÚNG số liệu KNOWN_REGRESSIONS của oracle, không đổi.
+
+
+def test_35_known_regression_total_below_min_single_day():
+    """KNOWN_REGRESSIONS[0]: total=12 < min=25, một ngày fc=29.
+
+    Trace gốc trong review: `_place_min_blocks` có nhánh `total < min_minutes
+    → minutes[order[0]] = total` — gán thẳng 12' vào ngày dù 12' không thể là
+    một block hợp lệ. fc=29 đủ chỗ chứa 12' về mặt CAPACITY nên vòng clip
+    không bắt được — bug chỉ lộ ra qua bất biến kích thước, không phải qua
+    tràn capacity. Sau bản sửa: 12' không được xếp, không phải shortfall bị
+    `allocate_assignments` tính "đủ" một cách sai lầm."""
+    from scheduler_core.allocate import _allocate_branch_a
+
+    result = _allocate_branch_a(12, [(0, 29)], 10, 25)
+    assert result == {0: 0}
+
+
+def test_36_known_regression_total_103_multi_day():
+    """KNOWN_REGRESSIONS[1]: total=103, 5 ngày fc=[31,31,35,0,45], min=30.
+
+    Case cụ thể review dùng để chứng minh bug KHÔNG đặc thù cho task nhỏ —
+    103' là estimate hoàn toàn bình thường, bug lộ ra vì phần dư kẹt lại ở
+    MỘT ngày cụ thể (ngày 1, fc=31) sau khi rải largest-remainder."""
+    from scheduler_core.allocate import _allocate_branch_a
+
+    day_fc = [(0, 31), (1, 31), (2, 35), (3, 0), (4, 45)]
+    result = _allocate_branch_a(103, day_fc, 15, 30)
+    fc = dict(day_fc)
+    for d, v in result.items():
+        assert v == 0 or v >= 30, f"day {d}={v} vi phạm min_minutes"
+        assert v <= fc[d], f"day {d}={v} vượt fc={fc[d]}"
+    assert sum(result.values()) <= 103
+
+
+def test_37_known_regression_total_268_four_days():
+    """KNOWN_REGRESSIONS[2]: total=268, 4 ngày fc=[20,90,40,120], min=20.
+
+    Case lớn nhất trong 3 case chính thức — ngày 0 (fc=20, đúng bằng min) là
+    nơi trước bản sửa bị ép nhận 18' (< min=20)."""
+    from scheduler_core.allocate import _allocate_branch_a
+
+    day_fc = [(0, 20), (1, 90), (2, 40), (3, 120)]
+    result = _allocate_branch_a(268, day_fc, 15, 20)
+    fc = dict(day_fc)
+    for d, v in result.items():
+        assert v == 0 or v >= 20, f"day {d}={v} vi phạm min_minutes"
+        assert v <= fc[d], f"day {d}={v} vượt fc={fc[d]}"
+    assert sum(result.values()) <= 268
+
+
+def test_38_original_oracle_zero_failing():
+    """Chạy chính oracle GỐC (`fuzz_allocate_reference.py`, tới tay sau khi
+    file đính kèm thật sự xuất hiện — trước đó không tồn tại trên máy) như
+    một module, không phải subprocess, để lỗi có traceback rõ trong pytest.
+    KNOWN_REGRESSIONS + 20.000 trial fuzz (seed 12345) đều phải sạch."""
+    import importlib.util
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    oracle_path = root / "fuzz_allocate_reference.py"
+    spec = importlib.util.spec_from_file_location("fuzz_allocate_reference", oracle_path)
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+
+    assert oracle.check_known_regressions() is True
+    assert oracle.main() == 0
+
+

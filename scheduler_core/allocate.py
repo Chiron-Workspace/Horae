@@ -178,6 +178,47 @@ def _cleanup_min(minutes, days, fc, unit, min_minutes):
     return minutes
 
 
+def _enforce_min_or_zero(minutes, days, fc, min_minutes):
+    """Chốt chặn cuối cùng: đảm bảo với mọi ngày, minutes[d] == 0 hoặc
+    minutes[d] >= min_minutes (INV1), và không vượt fc (INV2).
+
+    `_place_min_blocks`/`_cleanup_min` có thể (và trước bản sửa này, đã) để
+    lọt phần dư `0 < minutes[d] < min_minutes` qua các vòng redistribute nội
+    bộ — hàm này là lưới an toàn cuối, chạy SAU khi mọi logic nội bộ khác đã
+    xong, không sửa lại các hàm đó (Hướng B, xem NOTES.md — ít rủi ro hơn vì
+    tập trung một chỗ, đánh đổi lấy nợ kỹ thuật ở logic nội bộ vẫn "bẩn").
+
+    Với mỗi vi phạm còn sót: thử dồn sang một ngày KHÁC còn đủ chỗ để đạt
+    ``>= min_minutes`` sau khi cộng vào; nếu không ngày nào nhận được thì bỏ
+    hẳn (``minutes[d] = 0``) — phần đó biến mất khỏi tổng, tự nhiên trồi lên
+    thành ``shortfall`` ở `allocate_assignments` (INV4). Chỉ DI CHUYỂN hoặc
+    XÓA, không bao giờ cộng thêm tổng (INV3: không tự sinh phút).
+
+    Lặp tới khi ổn định: một violator có thể "gộp" vào một violator khác
+    được xử lý trước trong cùng vòng (đọc `minutes[e]` LIVE, không phải ảnh
+    chụp), nên phần lớn trường hợp ổn định sau đúng một vòng; vòng ngoài chỉ
+    là lưới an toàn cho các tương tác thứ tự hiếm gặp.
+    """
+    for _ in range(len(days) + 2):
+        violators = [d for d in days if 0 < minutes[d] < min_minutes]
+        if not violators:
+            break
+        for d in violators:
+            dust = minutes[d]
+            if not (0 < dust < min_minutes):
+                continue  # đã được gộp bởi một violator khác xử lý trước đó trong vòng này
+            minutes[d] = 0
+            for e in days:
+                if e == d:
+                    continue
+                room = fc[e] - minutes[e]
+                if room >= dust and minutes[e] + dust >= min_minutes:
+                    minutes[e] += dust
+                    break
+            # Không ngày nào nhận được → dust đã bị bỏ (minutes[d] = 0 ở trên).
+    return minutes
+
+
 def _allocate_branch_a(remaining, day_fc, unit, min_minutes):
     days = [d for d, _ in day_fc]
     fc = {d: c for d, c in day_fc}
@@ -199,6 +240,12 @@ def _allocate_branch_a(remaining, day_fc, unit, min_minutes):
         for d, _ in room_days:
             minutes[d] += add.get(d, 0)
         minutes = _cleanup_min(minutes, days, fc, unit, min_minutes)
+
+    # Lưới an toàn cuối cùng — xem docstring _enforce_min_or_zero.
+    for d in days:
+        if minutes[d] > fc[d]:
+            minutes[d] = fc[d]
+    minutes = _enforce_min_or_zero(minutes, days, fc, min_minutes)
 
     return minutes
 
