@@ -1255,3 +1255,78 @@ Case `total=12` khớp chính xác cơ chế review đã trace tay: nhánh `tota
 - `fuzz_allocate_reference.py` ở repo root giờ là **file gốc thật**, không phải bản tự viết.
 - Bug 1 + Bug 2: cả hai đã sửa, verify bằng oracle/test thật, sẵn sàng cho bước tiếp theo (bật ghi thật) về mặt hai bug này.
 
+---
+
+# NOTES — Quyết định: kết thúc giai đoạn dry-run, 2026-09-06
+
+**Quyết định của người dùng (Zinnn), không phải suy luận của agent**: chấp nhận "3 đêm dry-run sạch có điều kiện" và coi điều kiện kỹ thuật để chuyển sang bước "bật ghi thật, chạy tay, quan sát trực tiếp" đã đạt.
+
+## Dữ liệu quyết định dựa trên
+
+| Đêm | Ngày | `plan.ok` | Nguyên nhân | Side effect |
+|---|---|---|---|---|
+| 1 | 04/09 | True | — | 0 |
+| 2 | 05/09 | False | task "Dọn bàn" (15' < `min_minutes`=30) | 0 |
+| 3 | 06/09 | False | task "Dọn bàn" (cùng nguyên nhân) | 0 |
+
+4 task khác (Vật Lí, Hoá, IELTS, SAT) lên lịch đúng cả 3 đêm — đúng cơ chế mà tiêu chí 3-đêm nhắm kiểm chứng (sổ tiến độ từ event `[Auto]` quá khứ, cửa sổ D1/D2 trượt theo ngày chạy). Không có bất thường nào khác lộ ra. `plan.ok=False` cả hai đêm là do đúng MỘT nguyên nhân đã biết (`_allocate_branch_b` không kiểm `min_minutes`, xem mục Bug 1 phía trên), cô lập vào đúng task nhỏ, không lan sang task khác — và cổng toàn cục trong `reconcile.py` đã chặn đúng, không có side effect nào (`writer.created`/`writer.deleted` = 0 cả 3 đêm).
+
+## Hệ quả cần biết — KHÔNG hiểu nhầm là đã sửa xong
+
+Quyết định này đóng **cổng dry-run**, **không sửa `_allocate_branch_b`**. Bước ghi thật vẫn sẽ gặp đúng cơ chế này: bất kỳ đêm nào có một task nhỏ hơn `min_minutes` chưa gắn `[Nm]` tường minh, `plan.ok=False` sẽ lại chặn TOÀN BỘ ghi thật đêm đó — an toàn (không ghi gì) nhưng cũng không lên lịch được cho các task khác đêm đó. Đây là chế độ vận hành đã biết trước cho tới khi chính sách task-nhỏ được chốt và `_allocate_branch_b` được sửa, không phải lỗi mới nếu tái diễn.
+
+**Giảm thiểu tạm thời (không cần sửa code)**: dọn Todoist trước mỗi lần chạy — gắn `[Nm]` tường minh cho task nhỏ (đi qua regex, không qua LLM/branch B), hoặc hoàn thành/xóa nếu không cần lên lịch.
+
+## Trạng thái mở, chưa chốt (mang sang giai đoạn ghi thật)
+
+- Chính sách task-nhỏ — (a) bắt buộc `[Nm]` thủ công / (b) làm tròn lên sàn / (c) nhãn `@quick` riêng — vẫn hoãn, giờ áp dụng cho cả `_allocate_branch_a` (đã sửa qua `_enforce_min_or_zero`) lẫn `_allocate_branch_b` (chưa sửa, chính là nguyên nhân của đêm 2 và 3).
+- `parse_title.py` cache thiếu `cleaned_title` (lệch tiêu đề đúng 1 lần, mục review 3) — mức độ thấp, không chặn gì, chưa cần hành động.
+
+---
+
+# NOTES — Chính sách task nhỏ hơn min_minutes: Phương án 4 + 2 (quyết định 2026-09-06)
+
+Người dùng chọn qua `AskUserQuestion`: **Phương án 4 + 2**, ngưỡng làm tròn dùng đúng `config.blocks.min_minutes` hiện có (không thêm hằng số riêng).
+
+## Phương án 4 — sửa `_allocate_branch_b` (an toàn tuyệt đối, cả 2 tình huống)
+
+Xác nhận defect trước khi sửa: `_allocate_branch_b(15, [(0, 900)], 30)` → `{0: 15}` (force-fit, đúng cơ chế gây "Dọn bàn" fail đêm 2/3). Đây là **bản sao chính xác** của Bug 1 nhánh A, ở đường nhanh "cấp trọn trong một ngày":
+
+```python
+for d, cap in day_fc:
+    if cap >= remaining:
+        minutes[d] = remaining   # không kiểm remaining >= min_minutes
+```
+
+Sửa: thêm điều kiện `remaining >= min_minutes` trước khi vào đường nhanh. **Không cần** thêm backstop kiểu `_enforce_min_or_zero` như nhánh A — vòng chia-khối phía dưới của nhánh B đã có sẵn `if block < min_minutes: continue`, và khi `remaining < min_minutes` thì mọi `block = min(left, cap) <= remaining < min_minutes` nên vòng đó tự động không xếp gì, đúng INV1 sẵn có. Đây là lý do nhánh B chỉ cần sửa 1 dòng thay vì một hàm mới — bug hẹp hơn nhánh A về diện tích, dù cùng bản chất.
+
+Verify: 80.000 trial fuzz (4 seed × 20.000, `_allocate_branch_b` trực tiếp) → 0 vi phạm INV1/INV2/INV3 sau sửa. `test_39_dedicated_reproduction_of_don_ban_regression` (tái lập chính xác ca "Dọn bàn" qua `allocate_assignments` thật) và `test_40_branch_b_invariant_holds_across_large_random_sweep` (property-based, seed 20260906, 1000 trial) — cả hai xác nhận KHÔNG VÔ NGHĨA bằng cách tạm revert fix và thấy fail đúng kỳ vọng, rồi khôi phục.
+
+## Phương án 2 — làm tròn lên `min_minutes` ở tầng `parsing.py`
+
+Áp dụng đúng như quyết định: `if source in ("llm", "default") and 0 < minutes < config.blocks.min_minutes: minutes = config.blocks.min_minutes`. Đặt ngay trước khi dựng `Assignment`, sau khi `minutes`/`source` đã được xác định qua mọi nhánh (title/description/llm/default).
+
+**Không** áp dụng cho `source in ("title", "description")` — đúng nguyên tắc "không tự sửa ý định tường minh của người dùng": một task gắn `[15m]` rõ ràng là người dùng CHỦ Ý muốn 15 phút, hệ thống không được tự ý đổi thành 30'. Nhánh làm tròn chỉ chạm tới ước lượng do máy đoán (LLM) hoặc mặc định.
+
+Có cảnh báo kèm theo mỗi lần làm tròn (`"ước lượng X' (nguồn) nhỏ hơn min_minutes=Y', làm tròn lên Y'"`) — đúng quy ước minh bạch đã dùng cho các cảnh báo khác trong `parsing.py` (thiếu store, LLM thất bại...).
+
+Test: `test_parsing_tiny_llm_estimate_rounded_up` (case chính, tái lập "Dọn bàn"), `test_parsing_title_and_description_estimates_not_rounded` (xác nhận KHÔNG đụng ý định tường minh), `test_parsing_default_estimate_rounded_up_when_below_custom_min` (dùng `dataclasses.replace` dựng config `min_minutes=90` để lộ nhánh "default" — hằng số `DEFAULT_ESTIMATE_MINUTES=60` hiện luôn đủ lớn với mọi preset thật nên nhánh này không tự lộ ra bằng dữ liệu thật). Cả 3 xác nhận không vô nghĩa bằng cách tạm bỏ đoạn code rồi chạy lại — 2/3 fail đúng kỳ vọng (test thứ 3 đúng ra phải PASS cả khi tắt fix, vì nó kiểm KHÔNG làm tròn — đã xác nhận đúng vậy).
+
+## Xác nhận trên chính scenario thật (không phải fixture)
+
+Chạy lại dry-run snapshot live 2026-09-06 (script `dryrun_day3_v2.py`, xoá cache để LLM ước lượng lại từ đầu): LLM lần này cho "Dọn bàn" 10' (khác 15' hôm qua — đúng tính phi xác định đã biết của LLM, không phải lỗi), làm tròn lên 30', lên lịch thật:
+
+```
+plan.ok=True  gate_passed=True
+blocks: 8 (kể cả "Dọn bàn" 2026-09-07 07:00–07:30)
+warnings: "ước lượng 10' (llm) nhỏ hơn min_minutes=30', làm tròn lên 30' để lên lịch được"
+checks fail: [warning] small_task_buffer (không chặn, chỉ cảnh báo)
+```
+
+`plan.ok=False` do lý do kích thước — nguyên nhân của cả đêm 2 và 3 — giờ đã hết, cho cả dữ liệu thật lẫn fixture.
+
+## Kết quả
+
+- **270 test pass** (265 sau các bước trước + 2 branch-B + 3 parsing-rounding).
+- `_allocate_branch_a` (Bug 1, đã sửa 2026-09-05) và `_allocate_branch_b` (sửa hôm nay) giờ cùng chung một bất biến: không bao giờ tạo block `0 < x < min_minutes`.
+- Việc mở còn lại theo đúng quyết định: Phương án 3 (`@quick`, tách việc vặt khỏi `scheduler_core` hoàn toàn) vẫn là cải tiến UX tuỳ chọn cho sau này, không phải điều kiện an toàn — không làm trong lần này.

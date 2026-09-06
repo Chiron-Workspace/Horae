@@ -584,3 +584,60 @@ def test_38_original_oracle_zero_failing():
     assert oracle.main() == 0
 
 
+# ---------------------------------------------------------------- Bug 1, nhánh B
+#
+# Quyết định 2026-09-06 (xem NOTES.md "Phương án chốt chính sách task nhỏ hơn
+# min_minutes"): `_allocate_branch_b` có CÙNG defect với `_place_min_blocks`
+# (Bug 1 nhánh A) — đường nhanh "cấp trọn trong một ngày" gán thẳng `remaining`
+# không kiểm `>= min_minutes`. Đây chính là nguyên nhân "Dọn bàn" (15') làm
+# `plan.ok=False` ở dry-run đêm 2 và 3 (2026-09-05, 2026-09-06). Sửa: chỉ
+# thêm điều kiện `remaining >= min_minutes` trước khi vào đường nhanh — vòng
+# chia-khối phía dưới của branch B đã sẵn có `if block < min_minutes:
+# continue` nên không cần thêm lưới an toàn kiểu `_enforce_min_or_zero`.
+
+
+def test_39_dedicated_reproduction_of_don_ban_regression():
+    """Tái lập chính xác ca 'Dọn bàn' gây plan.ok=False ở dry-run đêm 2/3:
+    task 15' (đến từ LLM, < min_minutes=30), hạn ngày mai (days_until=1 <=
+    small_task_deadline_days=7) → branch B. Trước bản sửa: task được "lên
+    lịch" 15' — một block không hợp lệ, `run_checks` sẽ bắt `block_size`.
+    Sau bản sửa: 0' được xếp, toàn bộ 15' trồi lên shortfall — trung thực,
+    không tạo ra một block giả."""
+    days = [MON, TUE]
+    caps = _caps(days, 900)  # dư dả — không phải vấn đề capacity
+    task = _assignment("t1", TUE, 15)  # hạn ngày mai, y hệt "Dọn bàn"
+    result = allocate_assignments([task], caps, PRESET_STUDENT_VN)
+    assert _sum_task(result, "t1") == 0
+    assert result.shortfall.get("t1", 0) == 15
+    for d in days:
+        v = result.get(d, {}).get("t1", 0)
+        assert v == 0 or v >= PRESET_STUDENT_VN.blocks.min_minutes
+
+
+def test_40_branch_b_invariant_holds_across_large_random_sweep():
+    """Property-based (seed cố định, đồng bộ phong cách test_34 cho branch A):
+    _allocate_branch_b không bao giờ trả về 0 < phút < min, không bao giờ
+    vượt fc, không tự sinh phút."""
+    import random as _random
+    from scheduler_core.allocate import _allocate_branch_b
+
+    rng = _random.Random(20260906)
+    for _ in range(1000):
+        ndays = rng.randint(1, 6)
+        min_minutes = rng.choice([15, 30, 45, 60])
+        day_fc = [(d, rng.randint(0, 200)) for d in range(ndays)]
+        remaining = rng.randint(0, 500)
+        result = _allocate_branch_b(remaining, day_fc, min_minutes)
+        fc = dict(day_fc)
+        for d, v in result.items():
+            assert v == 0 or v >= min_minutes, (
+                f"seed=20260906 remaining={remaining} min={min_minutes} "
+                f"day_fc={day_fc} -> {result}: day {d}={v} vi phạm min_minutes"
+            )
+            assert v <= fc[d], (
+                f"seed=20260906 remaining={remaining} day_fc={day_fc} "
+                f"-> {result}: day {d}={v} vượt fc={fc[d]}"
+            )
+        assert sum(result.values()) <= remaining, (
+            f"seed=20260906 remaining={remaining} day_fc={day_fc} -> {result}: tự sinh phút"
+        )

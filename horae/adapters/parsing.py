@@ -274,6 +274,23 @@ def parse_tasks(
                         f"task {raw.task_id}: tiêu đề có nhiều [Nm], lấy cái đầu tiên"
                     )
 
+        # Việc tí hon (Phương án 2, quyết định 2026-09-06): ước lượng đến từ
+        # LLM hoặc mặc định — KHÔNG phải con số người dùng tự gõ ([Nm] hay
+        # description) — mà nhỏ hơn min_minutes thì không bao giờ tạo được
+        # một block hợp lệ (`_allocate_branch_a`/`_allocate_branch_b` đều sẽ
+        # đẩy nó vào shortfall, xem Bug 1). Làm tròn lên đúng
+        # config.blocks.min_minutes để việc vẫn thực sự lên lịch được, thay
+        # vì lặng lẽ nằm trong shortfall. Không áp dụng cho "title"/
+        # "description": đó là số người dùng tự gõ, ý định tường minh, hệ
+        # thống không tự sửa.
+        if source in ("llm", "default") and 0 < minutes < config.blocks.min_minutes:
+            warns.append(
+                f"task {raw.task_id}: ước lượng {minutes}' ({source}) nhỏ hơn "
+                f"min_minutes={config.blocks.min_minutes}', làm tròn lên "
+                f"{config.blocks.min_minutes}' để lên lịch được"
+            )
+            minutes = config.blocks.min_minutes
+
         # Deadline
         deadline = _resolve_deadline(raw.due, config, tz)
 

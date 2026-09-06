@@ -154,6 +154,9 @@ _NEW_LLM_TESTS = (
     "test_parsing_llm_result_merged_correctly",
     "test_parsing_store_caches_llm_result",
     "test_parsing_llm_without_store_warns",
+    "test_parsing_tiny_llm_estimate_rounded_up",
+    "test_parsing_title_and_description_estimates_not_rounded",
+    "test_parsing_default_estimate_rounded_up_when_below_custom_min",
 )
 
 
@@ -296,3 +299,66 @@ def test_parsing_llm_without_store_warns():
     )
     assert not any("KHÔNG được cache" in w for w in r2.warnings)
 
+
+# ---------------------------------------------------------------- việc tí hon (quyết định 2026-09-06)
+
+
+def test_parsing_tiny_llm_estimate_rounded_up():
+    """LLM ước lượng 15' cho một task, min_minutes=30 (PRESET_STUDENT_VN) →
+    làm tròn lên 30', source vẫn 'llm', có cảnh báo nêu rõ đã làm tròn.
+
+    Đây chính là ca "Dọn bàn" gây plan.ok=False ở dry-run đêm 2/3
+    (2026-09-05, 2026-09-06) — Phương án 2 trong quyết định chính sách."""
+    llm = FakeLLMClient(minutes=15, title="Dọn bàn")
+    r = parse_tasks(
+        [_task("t1", "Dọn bàn", due=date(2026, 1, 7))],
+        PRESET_STUDENT_VN,
+        llm,
+    )
+    a = r.assignments[0]
+    assert a.estimate_minutes == 30  # làm tròn lên đúng min_minutes
+    row = r.classifications[0]
+    assert row.source == "llm"  # nguồn không đổi, chỉ số phút đổi
+    assert any(
+        "làm tròn lên" in w and "30" in w for w in r.warnings
+    ), r.warnings
+
+
+def test_parsing_title_and_description_estimates_not_rounded():
+    """[Nm]/description do người dùng tự gõ — dù nhỏ hơn min_minutes vẫn
+    GIỮ NGUYÊN, không bị hệ thống tự làm tròn. Đây là ý định tường minh."""
+    r = parse_tasks(
+        [
+            _task("t1", "Việc nhỏ [15m]", due=date(2026, 1, 7)),
+            _task("t2", "Việc nhỏ khác", desc="Thời gian làm dự kiến: 15 phút",
+                  due=date(2026, 1, 7)),
+        ],
+        PRESET_STUDENT_VN,
+    )
+    by_id = {a.task_id: a for a in r.assignments}
+    assert by_id["t1"].estimate_minutes == 15
+    assert by_id["t2"].estimate_minutes == 15
+    sources = r.estimate_sources
+    assert sources["t1"] == "title"
+    assert sources["t2"] == "description"
+    assert not any("làm tròn lên" in w for w in r.warnings)
+
+
+def test_parsing_default_estimate_rounded_up_when_below_custom_min():
+    """DEFAULT_ESTIMATE_MINUTES=60 thường >= min_minutes mọi preset hiện có,
+    nên nhánh 'default' trong thực tế không cần làm tròn — nhưng cơ chế vẫn
+    phải đúng nếu ai đó cấu hình min_minutes > 60. Dùng config tuỳ biến
+    (min_minutes=90) để lộ ra nhánh này, không đợi preset thật thay đổi."""
+    from dataclasses import replace as _replace
+
+    config = _replace(
+        PRESET_STUDENT_VN, blocks=_replace(PRESET_STUDENT_VN.blocks, min_minutes=90)
+    )
+    r = parse_tasks(
+        [_task("t1", "Task tự do không parse được", due=date(2026, 1, 7))],
+        config,
+    )
+    a = r.assignments[0]
+    assert a.estimate_minutes == 90  # DEFAULT_ESTIMATE_MINUTES(60) làm tròn lên 90
+    assert r.estimate_sources["t1"] == "default"
+    assert any("làm tròn lên" in w and "90" in w for w in r.warnings)

@@ -252,14 +252,25 @@ def _allocate_branch_a(remaining, day_fc, unit, min_minutes):
 
 def _allocate_branch_b(remaining, day_fc, min_minutes):
     """Nhánh B: ngày sớm nhất có free_capacity >= remaining → cấp trọn.
-    Không có ngày nào đủ → chia thành các phần >= min theo thứ tự thời gian."""
+    Không có ngày nào đủ → chia thành các phần >= min theo thứ tự thời gian.
+
+    Đường nhanh (cấp trọn trong một ngày) CHỈ dùng khi ``remaining >=
+    min_minutes`` — cùng bug với `_place_min_blocks` (Bug 1, 2026-09-05):
+    trước sửa, đường này gán thẳng ``remaining`` bất kể nó có tạo được một
+    block hợp lệ hay không (một task 15' với ``min_minutes=30`` từng bị cấp
+    thẳng 15' miễn là có ngày rảnh đủ chỗ). Khi ``remaining < min_minutes``,
+    rơi thẳng xuống vòng chia-khối phía dưới — vòng đó đã có sẵn
+    ``if block < min_minutes: continue`` nên tự động không xếp gì (mọi
+    ``block <= remaining < min_minutes``), phần đó trồi lên đúng thành
+    shortfall ở `allocate_assignments`."""
     minutes = {d: 0 for d, _ in day_fc}
     if remaining <= 0:
         return minutes
-    for d, cap in day_fc:
-        if cap >= remaining:
-            minutes[d] = remaining
-            return minutes
+    if remaining >= min_minutes:
+        for d, cap in day_fc:
+            if cap >= remaining:
+                minutes[d] = remaining
+                return minutes
     left = remaining
     for d, cap in day_fc:
         if left <= 0:
