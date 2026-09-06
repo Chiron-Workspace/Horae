@@ -456,8 +456,9 @@ def reconcile(
     safety gate;
     with ``dry_run=True`` the returned plan is exact but no writer method is
     called.  ``now`` is an optional caller-supplied reference time used to
-    protect replacement deletes that have already started; omitting it keeps
-    the historical behavior and performs no clock lookup.
+    protect ANY planned delete whose block has already started
+    (``block.start <= now``), not only replacement deletes; omitting it
+    keeps the historical behavior and performs no clock lookup.
     """
     if existing_blocks is None:
         existing_blocks = existing if existing is not None else ()
@@ -518,7 +519,13 @@ def reconcile(
     diff_delete_errors: list[str] = []
     diff_create_errors: list[str] = []
     replacement_requirements: dict[int, tuple[str, ...]] = {}
-    replacement_delete_candidates: set[int] = set()
+    # Chỉ dùng để CHỌN CHỮ trong warning ("replacement delete" vs "delete") —
+    # KHÔNG dùng để giới hạn phạm vi kiểm "block đã bắt đầu" (xem vòng lặp
+    # `now` bên dưới): kiểm đó áp cho MỌI planned_deletes, không riêng
+    # replacement. Trước bản sửa này, tập này còn được dùng để lọc — đó
+    # chính là lỗ hổng: hai nhánh xóa phổ biến hơn (task bị xóa khỏi Todoist,
+    # và surplus khớp đúng subset) hoàn toàn không được bảo vệ.
+    replacement_ids: set[int] = set()
 
     for key in keys:
         existing_total = existing_totals.get(key, 0)
@@ -590,7 +597,7 @@ def reconcile(
                     )
                     for block in replacement_creates:
                         replacement_requirements[id(block)] = required_delete_ids
-                    replacement_delete_candidates.update(
+                    replacement_ids.update(
                         id(block) for block in chosen_deletes
                     )
                     diff_warnings.append(
@@ -731,26 +738,30 @@ def reconcile(
             if planned_creates and not callable(getattr(writer, "create_block", None)):
                 add_create_gate_error("writer không có create_block(block, meta)")
 
-    started_replacement = False
+    # Bảo vệ MỌI planned_deletes, không riêng nhánh replacement: đây là module
+    # duy nhất có quyền xóa dữ liệu thật, và hai nhánh "task bị xóa khỏi
+    # Todoist" (planned_total==0) và "surplus khớp exact subset" là hai lý do
+    # xóa phổ biến hơn nhánh replacement trong vận hành thật.
+    started_delete = False
     if now is not None:
         for block in planned_deletes:
-            if id(block) not in replacement_delete_candidates:
-                continue
             try:
                 started = block.start <= now
             except TypeError as exc:
+                kind = "replacement event" if id(block) in replacement_ids else "event"
                 add_delete_gate_error(
-                    f"không so sánh được now với replacement event {block.event_id}: {exc}"
+                    f"không so sánh được now với {kind} {block.event_id}: {exc}"
                 )
                 continue
             if started:
-                started_replacement = True
+                started_delete = True
+                label = "replacement delete" if id(block) in replacement_ids else "delete"
                 diff_warnings.append(
-                    f"replacement delete event {block.event_id} bị chặn: "
+                    f"{label} event {block.event_id} bị chặn: "
                     f"block đã bắt đầu (started) tại now={now.isoformat()}, không xóa"
                 )
 
-    gate_delete = not delete_gate_errors and not started_replacement
+    gate_delete = not delete_gate_errors and not started_delete
     gate_create = not create_gate_errors
     gate_passed = gate_delete and gate_create
     if not gate_delete and planned_deletes:

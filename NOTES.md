@@ -1115,3 +1115,44 @@ Lỗi thứ hai là hệ quả downstream của lỗi thứ nhất, không phả
 
 Đường LLM đã được xác nhận đầy đủ trên dữ liệu thật + provider thật + toàn bộ chuỗi (không chỉ `parse_tasks`). Khoảng trống cuối cùng nêu ở các lượt review trước đã khép.
 
+---
+
+# NOTES — Bug 2: mở rộng bảo vệ `now` ra mọi nhánh xóa (không riêng replacement)
+
+Giao việc từ spec bên ngoài (người dùng dán vào chat, không phải file đính kèm — xem phần "Nguồn của spec" cuối mục này).
+
+## Vấn đề đã xác nhận trực tiếp trong code (không chỉ tin theo spec)
+
+`replacement_delete_candidates` (tập `id()` các block được phép kiểm "đã bắt đầu chưa") chỉ được điền ở một chỗ duy nhất: bên trong nhánh `_latest_cover` (`reconcile.py`, nhánh "replacement" — xóa block nguyên vẹn rồi tạo bù phần lệch). Hai nhánh xóa còn lại:
+
+- `planned_total == 0` (task biến mất khỏi Todoist) — `chosen_deletes = existing_latest` thẳng, không đụng tập candidates.
+- `_exact_subset` khớp đúng (surplus giảm vừa đúng tổng một số block nguyên) — cũng không đụng tập candidates.
+
+Vòng kiểm `if now is not None: for block in planned_deletes: if id(block) not in replacement_delete_candidates: continue` bỏ qua hoàn toàn hai nhánh này. Đã verify bằng cách đọc trực tiếp `reconcile.py` (không dựa vào con số cụ thể nào từ spec bên ngoài) và bằng `grep` xác nhận `replacement_delete_candidates` chỉ được `.update()` ở đúng một chỗ.
+
+## Sửa
+
+- Bảo vệ `block.start <= now` giờ áp cho **mọi** `block in planned_deletes`, không lọc theo tập candidates nữa.
+- Tập candidates được **giữ lại nhưng đổi mục đích**: đổi tên `replacement_delete_candidates` → `replacement_ids`, chỉ còn dùng để chọn CHỮ trong warning (`"replacement delete"` vs `"delete"`), không còn dùng để giới hạn phạm vi kiểm. Lý do giữ thay vì xóa hẳn: `test_17b` đã có sẵn và assert đúng cụm `"replacement delete"` trong warning cho nhánh replacement — xóa hẳn khái niệm sẽ phải đổi cả câu chữ cho nhánh đó, không cần thiết và tăng rủi ro. Biến gating (`started_replacement` → `started_delete`) đổi tên để không còn ngụ ý phạm vi hẹp.
+- Docstring `reconcile()` và comment cổng `now_required_for_write` trong `runner.py`: bỏ chữ "replacement" khỏi mô tả phạm vi, khớp hành vi mới.
+- Ngữ nghĩa "đã bắt đầu" giữ nguyên `block.start <= now` (không đổi thành "đang diễn ra" `start <= now < end`) — chỉ mở PHẠM VI, không đổi NGỮ NGHĨA, để tách bạch hai loại thay đổi.
+
+## Rà soát bắt buộc trước khi merge
+
+`grep -n "now=" tests/test_reconcile.py` → chỉ có đúng **một** chỗ (`test_17b`), đã ở nhánh replacement, không bị ảnh hưởng. Không có test nào khác truyền `now=` mà rơi vào hai nhánh còn lại, nên không có test cũ nào cần đổi kỳ vọng.
+
+## Test mới (phá hoại, assert bằng writer thật — cùng phong cách `test_17b`)
+
+- `test_started_full_removal_skips_delete`: task biến mất khỏi Todoist, block đã bắt đầu → `writer.deleted == []`, create không liên quan (`t2`) vẫn chạy.
+- `test_started_exact_subset_surplus_skips_delete`: dựng cảnh cụ thể để `_exact_subset` được chọn (không qua `_latest_cover`) — `old1` khớp interval chính xác với block kế hoạch (bị loại khỏi diện xóa qua `_match_planned_blocks`), `old2` còn lại đúng bằng surplus. `report.planned_delete_ids == ("old2",)` xác nhận đúng nhánh đi qua, block đã bắt đầu → không bị xóa.
+
+`gate_delete` vẫn là **per-run** (một block đã bắt đầu chặn toàn bộ delete trong lần chạy đó), giữ nguyên hành vi hiện tại của nhánh replacement — không đổi sang per-block, đúng khuyến nghị ít rủi ro hơn.
+
+## Kết quả
+
+- 257 test pass (255 + 2 mới cho Bug 2). `test_17a`/`test_17b` xanh nguyên trạng, không đổi assertion nào.
+
+## Nguồn của spec
+
+Bug 2 (và Bug 1, xem mục riêng) đến từ một tài liệu kế hoạch người dùng dán trực tiếp vào chat, tự mô tả là do một "review sâu" trước đó tạo ra và tham chiếu tới `claude/review-horae-deep-2026-09-05.md`, `claude/plan-fix-horae-2bugs-2026-09-05.md`, và `fuzz_allocate_reference.py` "đính kèm". Đã tìm trên toàn bộ filesystem (repo, mọi thư mục scratchpad phiên trước, `~/Downloads`) — **cả ba file đều không tồn tại**, không có gì được đính kèm thật. Với Bug 2, chẩn đoán trong spec khớp chính xác với code thật khi tự đọc độc lập (không có gì cần nghi ngờ). Với Bug 1, spec dựa vào kết quả cụ thể của `fuzz_allocate_reference.py` (số lần thử, số counterexample) làm tiêu chí "xong" — file đó không có nên chưa thể tuyên bố đạt tiêu chí đó; xem mục Bug 1 bên dưới.
+

@@ -203,6 +203,65 @@ def test_17b_started_replacement_skips_delete_but_runs_unrelated_create():
     assert any("delete gate" in warning for warning in report.warnings)
 
 
+def test_started_full_removal_skips_delete():
+    """Task biến mất khỏi Todoist (planned_total=0) → nhánh KHÔNG PHẢI replacement.
+
+    Trước bản sửa, `now` chỉ bảo vệ nhánh replacement (_latest_cover); một
+    block đã bắt đầu trong nhánh "xóa toàn bộ vì task không còn" bị xóa vô
+    điều kiện. Đây là nhánh xóa phổ biến hơn replacement trong vận hành thật.
+    """
+    existing = [_auto("old", "t1", D1, 7, 60)]
+    writer = FakeCalendarWriter(existing_blocks=existing)
+    report = _run(
+        _plan([_block("t2", D1, 10, 30)]),  # t1 không còn trong kế hoạch
+        existing,
+        {"t2"},  # t1 cũng không còn trong Todoist
+        writer=writer,
+        now=datetime.combine(D1, time(7, 0), tzinfo=TZ),  # sau khi "old" đã bắt đầu
+    )
+
+    assert not report.gate_delete
+    assert report.gate_create
+    assert writer.deleted == []  # block đã bắt đầu KHÔNG bị xóa
+    assert [(block.task_id, block.duration_minutes) for block, _, _ in writer.created] == [
+        ("t2", 30)
+    ]  # create không liên quan vẫn chạy bình thường
+    assert any("delete" in warning and "đã bắt đầu" in warning for warning in report.warnings)
+    assert "old" in report.planned_delete_ids
+
+
+def test_started_exact_subset_surplus_skips_delete():
+    """Surplus khớp đúng exact subset (không qua _latest_cover) → cũng phải được bảo vệ.
+
+    old1 khớp interval CHÍNH XÁC với block kế hoạch (bị loại khỏi diện xóa
+    qua _match_planned_blocks), old2 còn lại đúng bằng surplus → _exact_subset
+    chọn nó thẳng, không đi qua nhánh replacement.
+    """
+    old1 = _auto("old1", "t1", D1, 7, 30)   # khớp block kế hoạch bên dưới
+    old2 = _auto("old2", "t1", D1, 9, 30)   # surplus == đúng bằng cái này
+    existing = [old1, old2]
+    writer = FakeCalendarWriter(existing_blocks=existing)
+    report = _run(
+        _plan([
+            _block("t1", D1, 7, 30),   # interval y hệt old1 → matched, giữ lại
+            _block("t2", D1, 12, 30),  # task khác, không liên quan
+        ]),
+        existing,
+        {"t1", "t2"},
+        writer=writer,
+        now=datetime.combine(D1, time(9, 0), tzinfo=TZ),  # sau khi old2 đã bắt đầu
+    )
+
+    assert report.planned_delete_ids == ("old2",)  # xác nhận đi qua exact subset, không phải _latest_cover
+    assert not report.gate_delete
+    assert report.gate_create
+    assert writer.deleted == []  # old2 đã bắt đầu, KHÔNG bị xóa
+    assert [(block.task_id, block.duration_minutes) for block, _, _ in writer.created] == [
+        ("t2", 30)
+    ]
+    assert any("delete" in warning and "đã bắt đầu" in warning for warning in report.warnings)
+
+
 # ---------------------------------------------------------------- safety 18-23
 
 
